@@ -1,0 +1,332 @@
+"""Exact path-dependent C++ TreeSHAP predictor for Vertex AI CPR."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import math
+import os
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+
+# Lock OpenMP thread count to 1 for deterministic TreeSHAP floating-point reduction.
+os.environ["OMP_NUM_THREADS"] = "1"
+
+RESTRICTED_PII_KEYS: frozenset[str] = frozenset({
+    "customer_ic_number",
+    "nric",
+    "passport_number",
+})
+
+REASON_RULE_VERSION = "bnm-fair-lending-v1.0"
+SCHEMA_VERSION = "v1"
+
+DEFAULT_ADVERSE_REASON_CODES: dict[str, tuple[str, str]] = {
+    "delinquency_count_12m": (
+        "RC_DELINQ_12M",
+        "Recent delinquency events in the past twelve months.",
+    ),
+    "credit_utilization_ratio": (
+        "RC_HIGH_UTIL",
+        "High revolving credit balance relative to total credit limit.",
+    ),
+    "debt_to_income_ratio": (
+        "RC_HIGH_DTI",
+        "Elevated debt-to-income obligation ratio.",
+    ),
+    "tenure_months": (
+        "RC_SHORT_TENURE",
+        "Insufficient account or relationship tenure length.",
+    ),
+    "avg_monthly_spend": (
+        "RC_LOW_SPEND_ACTIVITY",
+        "Low observed monthly account transaction activity.",
+    ),
+    "verified_income_band": (
+        "RC_INCOME_BAND",
+        "Verified income tier below threshold for requested credit.",
+    ),
+}
+
+
+def _stable_sigmoid(margin: float) -> float:
+    if margin >= 0.0:
+        return 1.0 / (1.0 + math.exp(-margin))
+    exp_x = math.exp(margin)
+    return exp_x / (1.0 + exp_x)
+
+
+def compute_sha256_file(path: Path) -> str:
+    """Compute lowercase hexadecimal SHA-256 digest of a file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def rank_adverse_features(
+    shap_logit_map: Mapping[str, float],
+    explained_class: str = "APPROVE",
+    top_k: int = 4,
+    reason_codes: Mapping[str, tuple[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    """Rank top adverse features with deterministic alphabetical tie-breaking."""
+    if top_k <= 0:
+        return []
+    codes = reason_codes if reason_codes is not None else DEFAULT_ADVERSE_REASON_CODES
+    normalized_class = explained_class.strip().upper()
+
+    if normalized_class == "APPROVE":
+        candidates = [(feat, float(val)) for feat, val in shap_logit_map.items() if float(val) < 0.0]
+        # Most negative log-odds reduces approval most; ties break alphabetically by feature name.
+        candidates.sort(key=lambda kv: (kv[1], kv[0]))
+    else:
+        candidates = [(feat, float(val)) for feat, val in shap_logit_map.items() if float(val) > 0.0]
+        # Most positive log-odds pushes toward rejection/default most; ties break alphabetically.
+        candidates.sort(key=lambda kv: (-kv[1], kv[0]))
+
+    ranked: list[dict[str, Any]] = []
+    for feat, val in candidates[:top_k]:
+        code, description = codes.get(
+            feat,
+            (f"RC_{feat.upper()}", f"Adverse model factor: {feat}."),
+        )
+        ranked.append({
+            "feature": feat,
+            "reason_code": code,
+            "reason_text": description,
+            "shap_logit": float(val),
+        })
+    return ranked
+
+
+class TreeShapCprPredictor:
+    """Fail-closed XGBoost predictor enforcing exact TreeSHAP additivity."""
+
+    def __init__(
+        self,
+        booster: Any,
+        feature_names: Sequence[str],
+        model_id: str,
+        model_version_id: str,
+        model_artifact_sha256: str,
+        container_image_digest: str,
+        additivity_tolerance: float = 1e-5,
+        explained_class: str = "APPROVE",
+        top_k_reasons: int = 4,
+        reason_rule_version: str = REASON_RULE_VERSION,
+        dmatrix_factory: Callable[[list[list[float]], Sequence[str]], Any] | None = None,
+    ) -> None:
+        os.environ["OMP_NUM_THREADS"] = "1"
+        if not feature_names:
+            raise ValueError("feature_names must contain at least one feature.")
+        if additivity_tolerance <= 0.0:
+            raise ValueError("additivity_tolerance must be positive.")
+        if not model_artifact_sha256.strip():
+            raise ValueError("model_artifact_sha256 must be non-empty.")
+
+        self.booster = booster
+        self.feature_names = list(feature_names)
+        self.model_id = model_id
+        self.model_version_id = model_version_id
+        self.model_artifact_sha256 = model_artifact_sha256
+        self.container_image_digest = container_image_digest
+        self.additivity_tolerance = float(additivity_tolerance)
+        self.explained_class = explained_class.strip().upper()
+        self.top_k_reasons = int(top_k_reasons)
+        self.reason_rule_version = reason_rule_version
+        self._dmatrix_factory = dmatrix_factory
+
+    @classmethod
+    def load_from_file(
+        cls,
+        model_path: str | Path,
+        expected_sha256: str,
+        feature_names: Sequence[str],
+        model_id: str,
+        model_version_id: str,
+        container_image_digest: str,
+        additivity_tolerance: float = 1e-5,
+        explained_class: str = "APPROVE",
+        top_k_reasons: int = 4,
+    ) -> "TreeShapCprPredictor":
+        """Verify SHA-256 manifest digest and load an XGBoost Booster artifact."""
+        artifact = Path(model_path)
+        if not artifact.is_file():
+            raise FileNotFoundError(f"Model artifact not found: {artifact}")
+        actual_sha256 = compute_sha256_file(artifact)
+        if not hmac.compare_digest(actual_sha256.lower(), expected_sha256.strip().lower()):
+            raise ValueError(
+                f"Model artifact SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256}"
+            )
+        import xgboost as xgb  # type: ignore
+
+        booster = xgb.Booster()
+        booster.load_model(str(artifact))
+        return cls(
+            booster=booster,
+            feature_names=feature_names,
+            model_id=model_id,
+            model_version_id=model_version_id,
+            model_artifact_sha256=actual_sha256,
+            container_image_digest=container_image_digest,
+            additivity_tolerance=additivity_tolerance,
+            explained_class=explained_class,
+            top_k_reasons=top_k_reasons,
+        )
+
+    def _build_dmatrix(self, row_values: list[float]) -> Any:
+        if self._dmatrix_factory is not None:
+            return self._dmatrix_factory([row_values], self.feature_names)
+        import xgboost as xgb  # type: ignore
+
+        return xgb.DMatrix([row_values], feature_names=self.feature_names)
+
+    def _validate_and_extract_features(self, instance: Mapping[str, Any]) -> dict[str, float]:
+        pii_hits = sorted(RESTRICTED_PII_KEYS.intersection(instance.keys()))
+        if pii_hits:
+            raise ValueError(f"Restricted PII keys rejected in feature payload: {', '.join(pii_hits)}")
+
+        clean_features: dict[str, float] = {}
+        for name in self.feature_names:
+            if name not in instance:
+                raise ValueError(f"Missing required feature: {name}")
+            val = instance[name]
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                raise ValueError(f"Feature '{name}' must be numeric, got {type(val).__name__}")
+            fval = float(val)
+            if math.isnan(fval) or math.isinf(fval):
+                raise ValueError(f"Feature '{name}' must be finite.")
+            clean_features[name] = fval
+        return clean_features
+
+    def predict_instance(
+        self,
+        instance: Mapping[str, Any],
+        entity_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Score one instance and compute exact TreeSHAP log-odds with additivity enforcement."""
+        clean_features = self._validate_and_extract_features(instance)
+        row_values = [clean_features[name] for name in self.feature_names]
+        dmatrix = self._build_dmatrix(row_values)
+
+        raw_margin_arr = self.booster.predict(dmatrix, output_margin=True)
+        contribs_arr = self.booster.predict(dmatrix, pred_contribs=True, approx_contribs=False)
+
+        raw_margin = float(raw_margin_arr[0])
+        contrib_row = [float(v) for v in contribs_arr[0]]
+        if len(contrib_row) != len(self.feature_names) + 1:
+            raise ValueError(
+                f"Expected {len(self.feature_names) + 1} TreeSHAP contributions, got {len(contrib_row)}"
+            )
+
+        shap_values = contrib_row[:-1]
+        base_logit = float(contrib_row[-1])
+        shap_sum_logit = float(sum(shap_values))
+
+        drift = abs((base_logit + shap_sum_logit) - raw_margin)
+        allowed_drift = self.additivity_tolerance * max(1.0, abs(raw_margin))
+        if drift > allowed_drift:
+            raise ValueError(
+                f"TreeSHAP additivity breach: |({base_logit} + {shap_sum_logit}) - {raw_margin}| = "
+                f"{drift} > tolerance {allowed_drift}"
+            )
+
+        shap_logit_map = {
+            name: float(val)
+            for name, val in zip(self.feature_names, shap_values)
+        }
+        top_adverse = rank_adverse_features(
+            shap_logit_map=shap_logit_map,
+            explained_class=self.explained_class,
+            top_k=self.top_k_reasons,
+        )
+        approve_prob = _stable_sigmoid(raw_margin)
+
+        resolved_entity_id = entity_id if entity_id is not None else str(instance.get("entity_id", ""))
+        return {
+            "entity_id": resolved_entity_id,
+            "model_id": self.model_id,
+            "model_version_id": self.model_version_id,
+            "model_artifact_sha256": self.model_artifact_sha256,
+            "container_image_digest": self.container_image_digest,
+            "schema_version": SCHEMA_VERSION,
+            "explained_class": self.explained_class,
+            "approve_prob": float(approve_prob),
+            "raw_margin": float(raw_margin),
+            "base_logit": float(base_logit),
+            "shap_sum_logit": float(shap_sum_logit),
+            "shap_logit_map": shap_logit_map,
+            "top_adverse_reasons": top_adverse,
+            "feature_payload": clean_features,
+            "reason_rule_version": self.reason_rule_version,
+        }
+
+    def predict(self, request_payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Handle Vertex AI :predict request envelope."""
+        instances = request_payload.get("instances")
+        if not isinstance(instances, list) or not instances:
+            raise ValueError("Request body must contain a non-empty 'instances' list.")
+        predictions = [self.predict_instance(inst) for inst in instances]
+        return {"predictions": predictions}
+
+
+def create_cpr_wsgi_app(predictor: TreeShapCprPredictor) -> Callable[..., list[bytes]]:
+    """Create a PEP 3333 WSGI application for Vertex AI Custom Prediction Routine."""
+
+    def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> list[bytes]:
+        path = environ.get("PATH_INFO", "/")
+        method = environ.get("REQUEST_METHOD", "GET").upper()
+
+        if path == "/health" and method == "GET":
+            body = json.dumps({"status": "ok", "omp_num_threads": os.environ.get("OMP_NUM_THREADS")}).encode("utf-8")
+            start_response("200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
+            return [body]
+
+        if path == "/predict" and method == "POST":
+            try:
+                length = int(environ.get("CONTENT_LENGTH") or 0)
+                raw_body = environ["wsgi.input"].read(length) if length > 0 else b"{}"
+                payload = json.loads(raw_body.decode("utf-8"))
+                result = predictor.predict(payload)
+                body = json.dumps(result).encode("utf-8")
+                start_response("200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
+                return [body]
+            except ValueError as exc:
+                body = json.dumps({"error": str(exc)}).encode("utf-8")
+                start_response("400 Bad Request", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
+                return [body]
+
+        body = json.dumps({"error": "Not found"}).encode("utf-8")
+        start_response("404 Not Found", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
+        return [body]
+
+    return application
+
+
+_LAZY_CPR_APP: Callable[..., list[bytes]] | None = None
+
+
+def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> list[bytes]:
+    """Lazy Gunicorn WSGI entrypoint loading a SHA-256 verified XGBoost artifact."""
+    global _LAZY_CPR_APP
+    if _LAZY_CPR_APP is None:
+        model_path = os.environ.get("MODEL_PATH", "").strip()
+        expected_sha = os.environ.get("EXPECTED_MODEL_SHA256", "").strip()
+        raw_features = os.environ.get("FEATURE_NAMES", "").strip()
+        feature_names = [f.strip() for f in raw_features.split(",") if f.strip()]
+        if not model_path or not expected_sha or not feature_names:
+            raise RuntimeError("MODEL_PATH, EXPECTED_MODEL_SHA256, and FEATURE_NAMES are required.")
+        predictor = TreeShapCprPredictor.load_from_file(
+            model_path=model_path,
+            expected_sha256=expected_sha,
+            feature_names=feature_names,
+            model_id=os.environ.get("MODEL_ID", "credit_xgb_cpr"),
+            model_version_id=os.environ.get("MODEL_VERSION_ID", "1"),
+            container_image_digest=os.environ.get("CONTAINER_IMAGE_DIGEST", "unpinned"),
+            additivity_tolerance=float(os.environ.get("SHAP_ADDITIVITY_TOLERANCE", "0.00001")),
+        )
+        _LAZY_CPR_APP = create_cpr_wsgi_app(predictor)
+    return _LAZY_CPR_APP(environ, start_response)

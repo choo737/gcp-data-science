@@ -1,0 +1,18 @@
+# Link upstream gcp-foundation outputs via scripts/link-stages.sh before applying.
+# Store environment-specific values in envs/<env>.tfvars or untracked custom.auto.tfvars.
+environment                   = "dev"
+prefix                        = "ent-dev"
+region                        = "asia-southeast1"
+core_project_id               = "example-core-project"
+ds_exp_project_id             = "example-ds-exp-project"
+ml_ops_project_id             = "example-ml-ops-project"
+silver_dataset_id             = "ent_silver_curated"
+ml_audit_dataset_id           = "ent_ml_xai_audit"
+ml_artifact_repo_id           = "ml-containers"
+ds_serving_track              = "bqml_batch"
+enable_bqml_schedule          = false
+enable_online_feature_store   = false
+enable_scorer_service         = false
+deploy_cpr_model              = false
+fairness_min_disparate_impact = 0.80
+shap_additivity_tolerance     = 0.00001

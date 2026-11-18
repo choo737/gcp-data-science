@@ -1,0 +1,356 @@
+name: Terraform Deploy
+
+on:
+  pull_request:
+    paths:
+      - "modules/**"
+      - "sql/**"
+      - "src/**"
+      - "stages/**"
+      - "workflows/**"
+      - ".github/workflows/terraform-deploy.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "modules/**"
+      - "sql/**"
+      - "src/**"
+      - "stages/**"
+      - "workflows/**"
+      - ".github/workflows/terraform-deploy.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target deployment environment
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      domain_name:
+        description: Optional business-unit domain slug for multi-BU state namespacing
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: "1.8.5"
+          terraform_wrapper: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+
+      - name: Check formatting, validate stages, and run tests
+        run: |
+          make fmt-check
+          make validate
+          make test
+
+  apply-dev:
+    needs: validate
+    if: |
+      vars.GCP_WIF_PROVIDER != '' && (vars.GCP_DS_WIF_SA != '' || vars.GCP_WIF_SERVICE_ACCOUNT != '' || vars.GCP_SERVICE_ACCOUNT != '') && (vars.GCP_TFSTATE_BUCKET != '' || vars.TF_STATE_BUCKET != '') &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AUTO_DEPLOY_DEV == 'true') || (github.event_name == 'workflow_dispatch' && inputs.environment == 'dev'))
+    environment: dev
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DS_WIF_SA || vars.GCP_WIF_SERVICE_ACCOUNT || vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: "1.8.5"
+          terraform_wrapper: false
+
+      - name: Link foundation outputs when configured
+        if: vars.IAC_OUTPUTS_BUCKET != ''
+        env:
+          IAC_OUTPUTS_BUCKET: ${{ vars.IAC_OUTPUTS_BUCKET }}
+          DOMAIN_NAME: ${{ inputs.domain_name || vars.DOMAIN_NAME || '' }}
+        run: |
+          if [[ ! "${IAC_OUTPUTS_BUCKET}" =~ ^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$ ]]; then
+            echo "Invalid IAC_OUTPUTS_BUCKET" >&2
+            exit 1
+          fi
+          if [ -n "${DOMAIN_NAME}" ]; then
+            if [[ ! "${DOMAIN_NAME}" =~ ^[a-z][a-z0-9-]{0,19}[a-z0-9]$ ]]; then
+              echo "Invalid DOMAIN_NAME" >&2
+              exit 1
+            fi
+            ./scripts/link-stages.sh --env dev --domain-name "${DOMAIN_NAME}" \
+              --from-gcs "gs://${IAC_OUTPUTS_BUCKET}/foundation-outputs.json" \
+              stages/enterprise
+          else
+            ./scripts/link-stages.sh --env dev \
+              --from-gcs "gs://${IAC_OUTPUTS_BUCKET}/foundation-outputs.json" \
+              stages/enterprise
+          fi
+
+      - name: Terraform init and apply (dev)
+        env:
+          TF_STATE_BUCKET: ${{ vars.GCP_TFSTATE_BUCKET || vars.TF_STATE_BUCKET }}
+          IAC_OUTPUTS_BUCKET: ${{ vars.IAC_OUTPUTS_BUCKET }}
+          DOMAIN_NAME: ${{ inputs.domain_name || vars.DOMAIN_NAME || '' }}
+        run: |
+          if [[ ! "${TF_STATE_BUCKET}" =~ ^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$ ]]; then
+            echo "Invalid TF_STATE_BUCKET" >&2
+            exit 1
+          fi
+          if [ -n "${DOMAIN_NAME}" ]; then
+            if [[ ! "${DOMAIN_NAME}" =~ ^[a-z][a-z0-9-]{0,19}[a-z0-9]$ ]]; then
+              echo "Invalid DOMAIN_NAME" >&2
+              exit 1
+            fi
+            BACKEND_PREFIX="data-science/${DOMAIN_NAME}/enterprise/dev"
+          else
+            BACKEND_PREFIX="data-science/enterprise/dev"
+          fi
+          terraform -chdir=stages/enterprise init -reconfigure \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="prefix=${BACKEND_PREFIX}"
+          if [ -f stages/enterprise/envs/dev.tfvars ]; then
+            terraform -chdir=stages/enterprise apply -auto-approve -var-file=envs/dev.tfvars
+          else
+            terraform -chdir=stages/enterprise apply -auto-approve
+          fi
+          if [ -n "${IAC_OUTPUTS_BUCKET}" ]; then
+            ./scripts/link-stages.sh --env dev --tfstate-bucket "${TF_STATE_BUCKET}" \
+              --export-gcs "gs://${IAC_OUTPUTS_BUCKET}/data-science/data-science-outputs.json" \
+              stages/enterprise
+          fi
+
+  apply-staging:
+    needs:
+      - validate
+      - apply-dev
+    if: |
+      always() && needs.validate.result == 'success' &&
+      vars.GCP_WIF_PROVIDER != '' && (vars.GCP_DS_WIF_SA != '' || vars.GCP_WIF_SERVICE_ACCOUNT != '' || vars.GCP_SERVICE_ACCOUNT != '') && (vars.GCP_TFSTATE_BUCKET != '' || vars.TF_STATE_BUCKET != '') &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AUTO_PROMOTE_STAGING == 'true' && needs.apply-dev.result == 'success') || (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging'))
+    environment: staging
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DS_WIF_SA || vars.GCP_WIF_SERVICE_ACCOUNT || vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: "1.8.5"
+          terraform_wrapper: false
+
+      - name: Link foundation outputs when configured
+        if: vars.IAC_OUTPUTS_BUCKET != ''
+        env:
+          IAC_OUTPUTS_BUCKET: ${{ vars.IAC_OUTPUTS_BUCKET }}
+          DOMAIN_NAME: ${{ inputs.domain_name || vars.DOMAIN_NAME || '' }}
+        run: |
+          if [[ ! "${IAC_OUTPUTS_BUCKET}" =~ ^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$ ]]; then
+            echo "Invalid IAC_OUTPUTS_BUCKET" >&2
+            exit 1
+          fi
+          if [ -n "${DOMAIN_NAME}" ]; then
+            if [[ ! "${DOMAIN_NAME}" =~ ^[a-z][a-z0-9-]{0,19}[a-z0-9]$ ]]; then
+              echo "Invalid DOMAIN_NAME" >&2
+              exit 1
+            fi
+            ./scripts/link-stages.sh --env staging --domain-name "${DOMAIN_NAME}" \
+              --from-gcs "gs://${IAC_OUTPUTS_BUCKET}/foundation-outputs.json" \
+              stages/enterprise
+          else
+            ./scripts/link-stages.sh --env staging \
+              --from-gcs "gs://${IAC_OUTPUTS_BUCKET}/foundation-outputs.json" \
+              stages/enterprise
+          fi
+
+      - name: Terraform init and apply (staging)
+        env:
+          TF_STATE_BUCKET: ${{ vars.GCP_TFSTATE_BUCKET || vars.TF_STATE_BUCKET }}
+          IAC_OUTPUTS_BUCKET: ${{ vars.IAC_OUTPUTS_BUCKET }}
+          DOMAIN_NAME: ${{ inputs.domain_name || vars.DOMAIN_NAME || '' }}
+        run: |
+          if [[ ! "${TF_STATE_BUCKET}" =~ ^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$ ]]; then
+            echo "Invalid TF_STATE_BUCKET" >&2
+            exit 1
+          fi
+          if [ -n "${DOMAIN_NAME}" ]; then
+            if [[ ! "${DOMAIN_NAME}" =~ ^[a-z][a-z0-9-]{0,19}[a-z0-9]$ ]]; then
+              echo "Invalid DOMAIN_NAME" >&2
+              exit 1
+            fi
+            BACKEND_PREFIX="data-science/${DOMAIN_NAME}/enterprise/staging"
+          else
+            BACKEND_PREFIX="data-science/enterprise/staging"
+          fi
+          terraform -chdir=stages/enterprise init -reconfigure \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="prefix=${BACKEND_PREFIX}"
+          if [ -f stages/enterprise/envs/staging.tfvars ]; then
+            terraform -chdir=stages/enterprise apply -auto-approve -var-file=envs/staging.tfvars
+          else
+            terraform -chdir=stages/enterprise apply -auto-approve
+          fi
+          if [ -n "${IAC_OUTPUTS_BUCKET}" ]; then
+            ./scripts/link-stages.sh --env staging --tfstate-bucket "${TF_STATE_BUCKET}" \
+              --export-gcs "gs://${IAC_OUTPUTS_BUCKET}/data-science/data-science-outputs.json" \
+              stages/enterprise
+          fi
+
+  model-validator-gate:
+    needs:
+      - validate
+      - apply-staging
+    if: |
+      always() && needs.validate.result == 'success' &&
+      vars.GCP_WIF_PROVIDER != '' && (vars.GCP_DS_WIF_SA != '' || vars.GCP_WIF_SERVICE_ACCOUNT != '' || vars.GCP_SERVICE_ACCOUNT != '') && (vars.GCP_TFSTATE_BUCKET != '' || vars.TF_STATE_BUCKET != '') &&
+      github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
+    environment: model-validator
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+
+      - name: Run MRM validation suite
+        env:
+          MRM_EVAL_INPUT_JSON: ${{ vars.MRM_EVAL_INPUT_JSON || '' }}
+        run: |
+          python3 -m unittest discover -s tests -v
+          if [ -n "${MRM_EVAL_INPUT_JSON}" ] && [ -f "${MRM_EVAL_INPUT_JSON}" ]; then
+            python3 -m src.mrm_validation.evaluate_gate --input-json "${MRM_EVAL_INPUT_JSON}" --output-card model_card.json
+          fi
+
+  apply-prod:
+    needs:
+      - validate
+      - model-validator-gate
+    if: |
+      needs.validate.result == 'success' && needs.model-validator-gate.result == 'success' &&
+      vars.GCP_WIF_PROVIDER != '' && (vars.GCP_DS_WIF_SA != '' || vars.GCP_WIF_SERVICE_ACCOUNT != '' || vars.GCP_SERVICE_ACCOUNT != '') && (vars.GCP_TFSTATE_BUCKET != '' || vars.TF_STATE_BUCKET != '') &&
+      github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
+    environment: prod
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DS_WIF_SA || vars.GCP_WIF_SERVICE_ACCOUNT || vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: "1.8.5"
+          terraform_wrapper: false
+
+      - name: Link foundation outputs when configured
+        if: vars.IAC_OUTPUTS_BUCKET != ''
+        env:
+          IAC_OUTPUTS_BUCKET: ${{ vars.IAC_OUTPUTS_BUCKET }}
+          DOMAIN_NAME: ${{ inputs.domain_name || vars.DOMAIN_NAME || '' }}
+        run: |
+          if [[ ! "${IAC_OUTPUTS_BUCKET}" =~ ^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$ ]]; then
+            echo "Invalid IAC_OUTPUTS_BUCKET" >&2
+            exit 1
+          fi
+          if [ -n "${DOMAIN_NAME}" ]; then
+            if [[ ! "${DOMAIN_NAME}" =~ ^[a-z][a-z0-9-]{0,19}[a-z0-9]$ ]]; then
+              echo "Invalid DOMAIN_NAME" >&2
+              exit 1
+            fi
+            ./scripts/link-stages.sh --env prod --domain-name "${DOMAIN_NAME}" \
+              --from-gcs "gs://${IAC_OUTPUTS_BUCKET}/foundation-outputs.json" \
+              stages/enterprise
+          else
+            ./scripts/link-stages.sh --env prod \
+              --from-gcs "gs://${IAC_OUTPUTS_BUCKET}/foundation-outputs.json" \
+              stages/enterprise
+          fi
+
+      - name: Terraform init and apply (prod)
+        env:
+          TF_STATE_BUCKET: ${{ vars.GCP_TFSTATE_BUCKET || vars.TF_STATE_BUCKET }}
+          IAC_OUTPUTS_BUCKET: ${{ vars.IAC_OUTPUTS_BUCKET }}
+          DOMAIN_NAME: ${{ inputs.domain_name || vars.DOMAIN_NAME || '' }}
+        run: |
+          if [[ ! "${TF_STATE_BUCKET}" =~ ^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$ ]]; then
+            echo "Invalid TF_STATE_BUCKET" >&2
+            exit 1
+          fi
+          if [ -n "${DOMAIN_NAME}" ]; then
+            if [[ ! "${DOMAIN_NAME}" =~ ^[a-z][a-z0-9-]{0,19}[a-z0-9]$ ]]; then
+              echo "Invalid DOMAIN_NAME" >&2
+              exit 1
+            fi
+            BACKEND_PREFIX="data-science/${DOMAIN_NAME}/enterprise/prod"
+          else
+            BACKEND_PREFIX="data-science/enterprise/prod"
+          fi
+          terraform -chdir=stages/enterprise init -reconfigure \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="prefix=${BACKEND_PREFIX}"
+          if [ -f stages/enterprise/envs/prod.tfvars ]; then
+            terraform -chdir=stages/enterprise apply -auto-approve -var-file=envs/prod.tfvars
+          else
+            terraform -chdir=stages/enterprise apply -auto-approve
+          fi
+          if [ -n "${IAC_OUTPUTS_BUCKET}" ]; then
+            ./scripts/link-stages.sh --env prod --tfstate-bucket "${TF_STATE_BUCKET}" \
+              --export-gcs "gs://${IAC_OUTPUTS_BUCKET}/data-science/data-science-outputs.json" \
+              stages/enterprise
+          fi

@@ -1,0 +1,14 @@
+# Link upstream gcp-foundation prod outputs via scripts/link-stages.sh --env prod before apply.
+# Pin both scorer_container_image and cpr_container_image to immutable @sha256 digests.
+environment                   = "prod"
+prefix                        = "ent"
+region                        = "asia-southeast1"
+ds_serving_track              = "both"
+enable_bqml_schedule          = true
+enable_online_feature_store   = true
+enable_scorer_service         = true
+scorer_container_image        = "asia-southeast1-docker.pkg.dev/example-ml-ops-project/ml-containers/xai-scorer@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+deploy_cpr_model              = true
+cpr_container_image           = "asia-southeast1-docker.pkg.dev/example-ml-ops-project/ml-containers/cpr-treeshap@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+fairness_min_disparate_impact = 0.80
+shap_additivity_tolerance     = 0.00001

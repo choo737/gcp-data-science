@@ -1,0 +1,269 @@
+main:
+  params: [input]
+  steps:
+    - init_vars:
+        assign:
+          - project_id: ${sys.get_env("ML_OPS_PROJECT_ID")}
+          - core_project_id: ${sys.get_env("CORE_PROJECT_ID")}
+          - silver_dataset_id: ${sys.get_env("SILVER_DATASET_ID")}
+          - feature_table: ${sys.get_env("FEATURE_GROUP_SOURCE_TABLE")}
+          - audit_dataset_id: ${sys.get_env("ML_AUDIT_DATASET_ID")}
+          - audit_table_id: ${sys.get_env("ML_AUDIT_TABLE_ID")}
+          - bq_location: ${sys.get_env("BQ_LOCATION")}
+          - model_id: ${sys.get_env("MODEL_ID")}
+          - reason_rule_version: ${sys.get_env("REASON_RULE_VERSION")}
+          - alert_topic: ${sys.get_env("ALERT_TOPIC_PATH")}
+          - execution_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+          - run_train: true
+    - check_train_flag:
+        switch:
+          - condition: ${"train_model" in input}
+            assign:
+              - run_train: ${input.train_model}
+    - run_pipeline:
+        try:
+          steps:
+            - maybe_train_model:
+                switch:
+                  - condition: ${run_train}
+                    next: submit_train_job
+                next: submit_explain_job
+            - submit_train_job:
+                call: run_bq_query
+                args:
+                  project_id: ${project_id}
+                  location: ${bq_location}
+                  query: |
+                    CREATE OR REPLACE MODEL `@model_fqn`
+                    OPTIONS (
+                      model_type = 'BOOSTED_TREE_CLASSIFIER',
+                      input_label_cols = ['approved_flag'],
+                      enable_global_explain = TRUE,
+                      model_registry = 'VERTEX_AI',
+                      vertex_ai_model_id = @model_id,
+                      max_iterations = 50,
+                      learn_rate = 0.1
+                    ) AS
+                    SELECT
+                      f.tenure_months,
+                      f.avg_monthly_spend,
+                      f.delinquency_count_12m,
+                      f.credit_utilization_ratio,
+                      f.debt_to_income_ratio,
+                      f.verified_income_band,
+                      f.approved_flag
+                    FROM ML.FEATURES_AT_TIME(
+                      TABLE `@feature_fqn`,
+                      time => CURRENT_TIMESTAMP(),
+                      num_rows => 1,
+                      ignore_feature_nulls => FALSE
+                    ) AS f
+                  params:
+                    - name: model_fqn
+                      parameterType:
+                        type: STRING
+                      parameterValue:
+                        value: ${project_id + "." + audit_dataset_id + "." + model_id}
+                    - name: feature_fqn
+                      parameterType:
+                        type: STRING
+                      parameterValue:
+                        value: ${core_project_id + "." + silver_dataset_id + "." + feature_table}
+                    - name: model_id
+                      parameterType:
+                        type: STRING
+                      parameterValue:
+                        value: ${model_id}
+                result: train_result
+            - submit_explain_job:
+                call: run_bq_query
+                args:
+                  project_id: ${project_id}
+                  location: ${bq_location}
+                  query: |
+                    INSERT INTO `@ledger_fqn` (
+                      decision_id,
+                      entity_id,
+                      decision_timestamp,
+                      serving_track,
+                      model_id,
+                      model_version_id,
+                      model_artifact_sha256,
+                      container_image_digest,
+                      schema_version,
+                      explained_class,
+                      approve_prob,
+                      raw_margin,
+                      base_logit,
+                      shap_sum_logit,
+                      shap_logit_map,
+                      top_adverse_reasons,
+                      feature_payload,
+                      reason_rule_version
+                    )
+                    SELECT
+                      GENERATE_UUID() AS decision_id,
+                      CAST(p.customer_id AS STRING) AS entity_id,
+                      CURRENT_TIMESTAMP() AS decision_timestamp,
+                      'bqml_batch' AS serving_track,
+                      @model_id AS model_id,
+                      @execution_id AS model_version_id,
+                      'bqml-managed' AS model_artifact_sha256,
+                      'bqml-native' AS container_image_digest,
+                      'v1' AS schema_version,
+                      'APPROVE' AS explained_class,
+                      CAST((SELECT prob FROM UNNEST(p.predicted_approved_flag_probs) WHERE label = 1) AS FLOAT64) AS approve_prob,
+                      LN(SAFE_DIVIDE(
+                        GREATEST(CAST((SELECT prob FROM UNNEST(p.predicted_approved_flag_probs) WHERE label = 1) AS FLOAT64), 1e-12),
+                        GREATEST(1.0 - CAST((SELECT prob FROM UNNEST(p.predicted_approved_flag_probs) WHERE label = 1) AS FLOAT64), 1e-12)
+                      )) AS raw_margin,
+                      CAST(p.baseline_prediction_value AS FLOAT64) AS base_logit,
+                      CAST((SELECT SUM(attr.attribution) FROM UNNEST(p.top_feature_attributions) AS attr) AS FLOAT64) AS shap_sum_logit,
+                      TO_JSON(ARRAY(SELECT AS STRUCT attr.feature, attr.attribution FROM UNNEST(p.top_feature_attributions) AS attr)) AS shap_logit_map,
+                      TO_JSON(ARRAY(
+                        SELECT AS STRUCT attr.feature, attr.attribution
+                        FROM UNNEST(p.top_feature_attributions) AS attr
+                        WHERE attr.attribution < 0
+                        ORDER BY attr.attribution ASC, attr.feature ASC
+                        LIMIT 4
+                      )) AS top_adverse_reasons,
+                      TO_JSON(STRUCT(
+                        p.tenure_months,
+                        p.avg_monthly_spend,
+                        p.delinquency_count_12m,
+                        p.credit_utilization_ratio,
+                        p.debt_to_income_ratio,
+                        p.verified_income_band
+                      )) AS feature_payload,
+                      @reason_rule_version AS reason_rule_version
+                    FROM ML.EXPLAIN_PREDICT(
+                      MODEL `@model_fqn`,
+                      (
+                        SELECT
+                          customer_id,
+                          tenure_months,
+                          avg_monthly_spend,
+                          delinquency_count_12m,
+                          credit_utilization_ratio,
+                          debt_to_income_ratio,
+                          verified_income_band
+                        FROM ML.FEATURES_AT_TIME(
+                          TABLE `@feature_fqn`,
+                          time => CURRENT_TIMESTAMP(),
+                          num_rows => 1,
+                          ignore_feature_nulls => FALSE
+                        )
+                      ),
+                      STRUCT(27 AS top_k_features, FALSE AS approx_feature_contrib)
+                    ) AS p
+                  params:
+                    - name: ledger_fqn
+                      parameterType:
+                        type: STRING
+                      parameterValue:
+                        value: ${project_id + "." + audit_dataset_id + "." + audit_table_id}
+                    - name: model_fqn
+                      parameterType:
+                        type: STRING
+                      parameterValue:
+                        value: ${project_id + "." + audit_dataset_id + "." + model_id}
+                    - name: feature_fqn
+                      parameterType:
+                        type: STRING
+                      parameterValue:
+                        value: ${core_project_id + "." + silver_dataset_id + "." + feature_table}
+                    - name: model_id
+                      parameterType:
+                        type: STRING
+                      parameterValue:
+                        value: ${model_id}
+                    - name: execution_id
+                      parameterType:
+                        type: STRING
+                      parameterValue:
+                        value: ${execution_id}
+                    - name: reason_rule_version
+                      parameterType:
+                        type: STRING
+                      parameterValue:
+                        value: ${reason_rule_version}
+                result: explain_result
+            - return_ok:
+                return:
+                  status: "SUCCEEDED"
+                  execution_id: ${execution_id}
+                  explain_job: ${explain_result.job_id}
+        except:
+          as: err
+          steps:
+            - publish_failure_alert:
+                call: http.post
+                args:
+                  url: ${"https://pubsub.googleapis.com/v1/" + alert_topic + ":publish"}
+                  auth:
+                    type: OAuth2
+                  body:
+                    messages:
+                      - data: ${base64.encode(json.encode(err))}
+            - fail_workflow:
+                raise: ${err}
+
+run_bq_query:
+  params: [project_id, location, query, params]
+  steps:
+    - submit_job:
+        call: http.post
+        args:
+          url: ${"https://bigquery.googleapis.com/bigquery/v2/projects/" + project_id + "/jobs"}
+          auth:
+            type: OAuth2
+          body:
+            configuration:
+              query:
+                query: ${query}
+                useLegacySql: false
+                parameterMode: "NAMED"
+                queryParameters: ${params}
+              labels:
+                pipeline: "track_a_bqml_xai"
+        result: job_resp
+    - init_poll:
+        assign:
+          - job_id: ${job_resp.body.jobReference.jobId}
+          - polls: 0
+          - max_polls: 120
+          - poll_interval_seconds: 10
+          - job_done: false
+    - poll_job:
+        call: http.get
+        args:
+          url: ${"https://bigquery.googleapis.com/bigquery/v2/projects/" + project_id + "/jobs/" + job_id}
+          query:
+            location: ${location}
+          auth:
+            type: OAuth2
+        result: status_resp
+    - check_job_done:
+        assign:
+          - polls: ${polls + 1}
+          - job_done: ${status_resp.body.status.state == "DONE"}
+        next: evaluate_poll
+    - evaluate_poll:
+        switch:
+          - condition: ${job_done}
+            next: verify_no_error
+          - condition: ${polls >= max_polls}
+            raise: ${"BigQuery job timed out after max_polls: " + job_id}
+        next: wait_before_retry
+    - wait_before_retry:
+        call: sys.sleep
+        args:
+          seconds: ${poll_interval_seconds}
+        next: poll_job
+    - verify_no_error:
+        switch:
+          - condition: ${"errorResult" in status_resp.body.status}
+            raise: ${status_resp.body.status.errorResult}
+        return:
+          job_id: ${job_id}
+          state: ${status_resp.body.status.state}
