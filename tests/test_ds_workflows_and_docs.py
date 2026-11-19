@@ -101,6 +101,8 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
         self.assertIn("environment: model-validator", deploy_text)
         self.assertIn("GCP_DS_WIF_SA || vars.GCP_WIF_SERVICE_ACCOUNT", deploy_text)
         self.assertIn("data-science/data-science-outputs.json", deploy_text)
+        self.assertIn('data-science/${DOMAIN_NAME}/data-science-outputs.json', deploy_text)
+        self.assertEqual(deploy_text.count('--domain-name "${DOMAIN_NAME}" --tfstate-bucket "${TF_STATE_BUCKET}"'), 3)
 
     def test_bqml_workflow_yaml_and_sql_contracts(self) -> None:
         wf_text = (REPO_ROOT / "workflows" / "bqml_xai_pipeline.workflows.yaml").read_text(encoding="utf-8")

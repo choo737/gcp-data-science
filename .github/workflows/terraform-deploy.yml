@@ -144,9 +144,15 @@ jobs:
             terraform -chdir=stages/enterprise apply -auto-approve
           fi
           if [ -n "${IAC_OUTPUTS_BUCKET}" ]; then
-            ./scripts/link-stages.sh --env dev --tfstate-bucket "${TF_STATE_BUCKET}" \
-              --export-gcs "gs://${IAC_OUTPUTS_BUCKET}/data-science/data-science-outputs.json" \
-              stages/enterprise
+            if [ -n "${DOMAIN_NAME}" ]; then
+              ./scripts/link-stages.sh --env dev --domain-name "${DOMAIN_NAME}" --tfstate-bucket "${TF_STATE_BUCKET}" \
+                --export-gcs "gs://${IAC_OUTPUTS_BUCKET}/data-science/${DOMAIN_NAME}/data-science-outputs.json" \
+                stages/enterprise
+            else
+              ./scripts/link-stages.sh --env dev --tfstate-bucket "${TF_STATE_BUCKET}" \
+                --export-gcs "gs://${IAC_OUTPUTS_BUCKET}/data-science/data-science-outputs.json" \
+                stages/enterprise
+            fi
           fi
 
   apply-staging:
@@ -233,9 +239,15 @@ jobs:
             terraform -chdir=stages/enterprise apply -auto-approve
           fi
           if [ -n "${IAC_OUTPUTS_BUCKET}" ]; then
-            ./scripts/link-stages.sh --env staging --tfstate-bucket "${TF_STATE_BUCKET}" \
-              --export-gcs "gs://${IAC_OUTPUTS_BUCKET}/data-science/data-science-outputs.json" \
-              stages/enterprise
+            if [ -n "${DOMAIN_NAME}" ]; then
+              ./scripts/link-stages.sh --env staging --domain-name "${DOMAIN_NAME}" --tfstate-bucket "${TF_STATE_BUCKET}" \
+                --export-gcs "gs://${IAC_OUTPUTS_BUCKET}/data-science/${DOMAIN_NAME}/data-science-outputs.json" \
+                stages/enterprise
+            else
+              ./scripts/link-stages.sh --env staging --tfstate-bucket "${TF_STATE_BUCKET}" \
+                --export-gcs "gs://${IAC_OUTPUTS_BUCKET}/data-science/data-science-outputs.json" \
+                stages/enterprise
+            fi
           fi
 
   model-validator-gate:
@@ -350,7 +362,13 @@ jobs:
             terraform -chdir=stages/enterprise apply -auto-approve
           fi
           if [ -n "${IAC_OUTPUTS_BUCKET}" ]; then
-            ./scripts/link-stages.sh --env prod --tfstate-bucket "${TF_STATE_BUCKET}" \
-              --export-gcs "gs://${IAC_OUTPUTS_BUCKET}/data-science/data-science-outputs.json" \
-              stages/enterprise
+            if [ -n "${DOMAIN_NAME}" ]; then
+              ./scripts/link-stages.sh --env prod --domain-name "${DOMAIN_NAME}" --tfstate-bucket "${TF_STATE_BUCKET}" \
+                --export-gcs "gs://${IAC_OUTPUTS_BUCKET}/data-science/${DOMAIN_NAME}/data-science-outputs.json" \
+                stages/enterprise
+            else
+              ./scripts/link-stages.sh --env prod --tfstate-bucket "${TF_STATE_BUCKET}" \
+                --export-gcs "gs://${IAC_OUTPUTS_BUCKET}/data-science/data-science-outputs.json" \
+                stages/enterprise
+            fi
           fi
