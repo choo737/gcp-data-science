@@ -834,6 +834,49 @@ class TreeShapAndMrmTest(unittest.TestCase):
             self.assertEqual(len(stale_attempts), 2)
             self.assertTrue(stale_attempts[0].startswith("http://10.10.0.26/"))
             self.assertTrue(stale_attempts[1].startswith("http://10.10.0.30/"))
+
+            # (d) Stale VERTEX_PSC_ENDPOINT_IP env var refreshes once to 10.0.0.2, then second /score hits cache directly.
+            invalidate_psc_cache()
+            stale_env_cfg = ScoringConfig(
+                ml_ops_project_id="ml-ops-proj",
+                region="asia-southeast1",
+                vertex_endpoint_id="1004200001",
+                ml_audit_dataset_id="ml_xai_audit",
+                vertex_psc_endpoint_ip="10.0.0.1",
+                environment="prod",
+            )
+            env_attempts: list[str] = []
+
+            def _post_env_failover(url: str, _inst: object) -> dict[str, object]:
+                env_attempts.append(url)
+                if "10.0.0.1" in url:
+                    raise ConnectionError("old env IP unreachable after model swap")
+                return ok_prediction
+
+            env_fetcher = MagicMock(return_value={
+                "privateServiceConnectConfig": {
+                    "pscAutomationConfigs": [{"state": "PSC_AUTOMATION_STATE_SUCCESSFUL", "ipAddress": "10.0.0.2"}]
+                }
+            })
+            svc_env = ScoringService(
+                config=stale_env_cfg,
+                ledger_writer=writer,
+                endpoint_metadata_fetcher=env_fetcher,
+                http_post_fn=_post_env_failover,
+            )
+            r1_status, _ = svc_env.score_applicant({"entity_id": "ent-100", "features": {"tenure_months": 24}})
+            r2_status, _ = svc_env.score_applicant({"entity_id": "ent-100", "features": {"tenure_months": 24}})
+            self.assertEqual(r1_status, 200)
+            self.assertEqual(r2_status, 200)
+            self.assertEqual(env_fetcher.call_count, 1)
+            self.assertEqual(
+                env_attempts,
+                [
+                    "http://10.0.0.1/v1/projects/ml-ops-proj/locations/asia-southeast1/endpoints/1004200001:predict",
+                    "http://10.0.0.2/v1/projects/ml-ops-proj/locations/asia-southeast1/endpoints/1004200001:predict",
+                    "http://10.0.0.2/v1/projects/ml-ops-proj/locations/asia-southeast1/endpoints/1004200001:predict",
+                ],
+            )
         finally:
             invalidate_psc_cache()
 
@@ -846,9 +889,8 @@ class TreeShapAndMrmTest(unittest.TestCase):
             "MODEL_FILENAME",
         )
         saved_env = {k: os.environ.get(k) for k in env_keys}
-        saved_lazy = cpr_predictor._LAZY_CPR_APP
         try:
-            cpr_predictor._LAZY_CPR_APP = None
+            cpr_predictor.reset_lazy_state_for_tests()
 
             # Missing env on /health returns 500 Internal Server Error.
             for k in env_keys:
@@ -860,41 +902,84 @@ class TreeShapAndMrmTest(unittest.TestCase):
             )
             self.assertEqual(err_statuses[0], "500 Internal Server Error")
 
-            # Cold gs:// AIP_STORAGE_URI on /health returns 200 without invoking GCS download.
+            # Cold gs:// AIP_STORAGE_URI on /health starts background load, returns 503 while in-flight, then 200.
             os.environ["AIP_STORAGE_URI"] = "gs://ml-models/run-1"
             os.environ["EXPECTED_MODEL_SHA256"] = "a" * 64
             os.environ["FEATURE_NAMES"] = '["tenure_months"]'
-            with patch.object(cpr_predictor.TreeShapCprPredictor, "load_from_file") as mock_load:
+
+            booster = _Float32BoosterAdapter(margin_f32=_float32(0.30), contribs_f32=[_float32(0.20), _float32(0.10)])
+            fake_pred = TreeShapCprPredictor(
+                booster=booster,
+                feature_names=["tenure_months"],
+                model_id="credit_xgb_cpr",
+                model_version_id="v1",
+                model_artifact_sha256="a" * 64,
+                container_image_digest="sha256:" + "b" * 64,
+                dmatrix_factory=lambda rows, feature_names: rows,
+            )
+
+            load_started = threading.Event()
+            allow_finish = threading.Event()
+
+            def _slow_gcs_load(**_kwargs: object) -> TreeShapCprPredictor:
+                load_started.set()
+                allow_finish.wait(timeout=5.0)
+                return fake_pred
+
+            with patch.object(cpr_predictor.TreeShapCprPredictor, "load_from_file", side_effect=_slow_gcs_load):
                 health_statuses: list[str] = []
                 chunks = cpr_predictor.application(
                     {"PATH_INFO": "/health", "REQUEST_METHOD": "GET"},
                     lambda s, _h: health_statuses.append(s),
                 )
-                self.assertEqual(health_statuses[0], "200 OK")
+                self.assertEqual(health_statuses[0], "503 Service Unavailable")
                 payload = json.loads(b"".join(chunks).decode("utf-8"))
-                self.assertEqual(payload["status"], "healthy")
+                self.assertEqual(payload["status"], "loading")
                 self.assertFalse(payload["model_loaded"])
-                mock_load.assert_not_called()
+                self.assertTrue(load_started.wait(timeout=2.0))
 
-            # Concurrent requests trigger load_from_file exactly once under _LAZY_CPR_LOCK.
-            cpr_predictor._LAZY_CPR_APP = None
+                allow_finish.set()
+                if cpr_predictor._BG_LOAD_THREAD is not None:
+                    cpr_predictor._BG_LOAD_THREAD.join(timeout=2.0)
+
+                ready_statuses: list[str] = []
+                ready_chunks = cpr_predictor.application(
+                    {"PATH_INFO": "/health", "REQUEST_METHOD": "GET"},
+                    lambda s, _h: ready_statuses.append(s),
+                )
+                self.assertEqual(ready_statuses[0], "200 OK")
+                ready_payload = json.loads(b"".join(ready_chunks).decode("utf-8"))
+                self.assertTrue(ready_payload["model_loaded"])
+
+            # Failed background gs:// SHA-256 verification causes /health to return 500.
+            cpr_predictor.reset_lazy_state_for_tests()
+            with patch.object(
+                cpr_predictor.TreeShapCprPredictor,
+                "load_from_file",
+                side_effect=ValueError("Model artifact SHA-256 mismatch"),
+            ):
+                cpr_predictor.application(
+                    {"PATH_INFO": "/health", "REQUEST_METHOD": "GET"},
+                    lambda _s, _h: None,
+                )
+                if cpr_predictor._BG_LOAD_THREAD is not None:
+                    cpr_predictor._BG_LOAD_THREAD.join(timeout=2.0)
+                fail_statuses: list[str] = []
+                fail_chunks = cpr_predictor.application(
+                    {"PATH_INFO": "/health", "REQUEST_METHOD": "GET"},
+                    lambda s, _h: fail_statuses.append(s),
+                )
+                self.assertEqual(fail_statuses[0], "500 Internal Server Error")
+                self.assertIn("SHA-256 mismatch", json.loads(b"".join(fail_chunks).decode("utf-8"))["error"])
+
+            # Concurrent /predict requests trigger load_from_file exactly once under _LAZY_CPR_LOCK.
+            cpr_predictor.reset_lazy_state_for_tests()
             os.environ.pop("AIP_STORAGE_URI", None)
             with tempfile.TemporaryDirectory() as td:
                 model_path = Path(td) / "model.ubj"
                 model_path.write_bytes(b"stub-bytes")
                 os.environ["MODEL_PATH"] = str(model_path)
                 os.environ["EXPECTED_MODEL_SHA256"] = hashlib.sha256(b"stub-bytes").hexdigest()
-
-                booster = _Float32BoosterAdapter(margin_f32=_float32(0.30), contribs_f32=[_float32(0.20), _float32(0.10)])
-                fake_pred = TreeShapCprPredictor(
-                    booster=booster,
-                    feature_names=["tenure_months"],
-                    model_id="credit_xgb_cpr",
-                    model_version_id="v1",
-                    model_artifact_sha256="a" * 64,
-                    container_image_digest="sha256:" + "b" * 64,
-                    dmatrix_factory=lambda rows, feature_names: rows,
-                )
 
                 barrier = threading.Barrier(4)
                 results: list[str] = []
@@ -926,7 +1011,7 @@ class TreeShapAndMrmTest(unittest.TestCase):
                     self.assertEqual(mock_load.call_count, 1)
                     self.assertEqual(results, ["200 OK"] * 4)
         finally:
-            cpr_predictor._LAZY_CPR_APP = saved_lazy
+            cpr_predictor.reset_lazy_state_for_tests()
             for k, val in saved_env.items():
                 if val is None:
                     os.environ.pop(k, None)

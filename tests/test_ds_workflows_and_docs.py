@@ -440,6 +440,29 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
             self.assertFalse(any(".." in l for l in init_lines), init_lines)
             self.assertTrue(any("-backend-config=prefix=data-science/retail/enterprise/staging" in l for l in init_lines), init_lines)
 
+            # Verify non-.git archive fallback resolves via parent directory of stages/foundation/data.
+            nogit_repo = tmp_path / "extracted-archive"
+            nogit_stage = nogit_repo / "data" / "enterprise" / "03-data-science"
+            (nogit_stage / "envs").mkdir(parents=True)
+            nogit_res = subprocess.run(
+                [
+                    str(script_path),
+                    "--env",
+                    "prod",
+                    "--tfstate-bucket",
+                    "state-bkt",
+                    str(nogit_stage),
+                    str(dst),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(nogit_res.returncode, 0, nogit_res.stderr)
+            nogit_lines = tf_log.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(any("-backend-config=prefix=data/enterprise/03-data-science/prod" in l for l in nogit_lines), nogit_lines)
+
 
 if __name__ == "__main__":
     unittest.main()

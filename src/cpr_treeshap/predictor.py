@@ -398,36 +398,84 @@ def _validate_cpr_env() -> tuple[str, str, list[str]]:
 
 _LAZY_CPR_APP: Callable[..., list[bytes]] | None = None
 _LAZY_CPR_LOCK = threading.Lock()
+_BG_LOAD_THREAD: threading.Thread | None = None
+_BG_LOAD_ERROR: Exception | None = None
 
 
-def _ensure_cpr_app_loaded() -> Callable[..., list[bytes]]:
+def reset_lazy_state_for_tests() -> None:
+    """Reset module-level lazy CPR WSGI and background loader state for unit tests."""
+    global _LAZY_CPR_APP, _BG_LOAD_THREAD, _BG_LOAD_ERROR
+    with _LAZY_CPR_LOCK:
+        _LAZY_CPR_APP = None
+        _BG_LOAD_THREAD = None
+        _BG_LOAD_ERROR = None
+
+
+def _load_cpr_app_locked() -> Callable[..., list[bytes]]:
     global _LAZY_CPR_APP
-    if _LAZY_CPR_APP is None:
-        with _LAZY_CPR_LOCK:
-            if _LAZY_CPR_APP is None:
-                model_source, expected_sha, feature_names = _validate_cpr_env()
-                predictor = TreeShapCprPredictor.load_from_file(
-                    model_path=model_source,
-                    expected_sha256=expected_sha,
-                    feature_names=feature_names,
-                    model_id=os.environ.get("MODEL_ID", "credit_xgb_cpr"),
-                    model_version_id=os.environ.get("MODEL_VERSION_ID", "1"),
-                    container_image_digest=os.environ.get("CONTAINER_IMAGE_DIGEST", "unpinned"),
-                    additivity_tolerance=float(os.environ.get("SHAP_ADDITIVITY_TOLERANCE", "0.00001")),
-                    reason_rule_version=os.environ.get("REASON_RULE_VERSION", REASON_RULE_VERSION),
-                )
-                _LAZY_CPR_APP = create_cpr_wsgi_app(predictor)
+    if _LAZY_CPR_APP is not None:
+        return _LAZY_CPR_APP
+    if _BG_LOAD_ERROR is not None:
+        raise _BG_LOAD_ERROR
+    model_source, expected_sha, feature_names = _validate_cpr_env()
+    predictor = TreeShapCprPredictor.load_from_file(
+        model_path=model_source,
+        expected_sha256=expected_sha,
+        feature_names=feature_names,
+        model_id=os.environ.get("MODEL_ID", "credit_xgb_cpr"),
+        model_version_id=os.environ.get("MODEL_VERSION_ID", "1"),
+        container_image_digest=os.environ.get("CONTAINER_IMAGE_DIGEST", "unpinned"),
+        additivity_tolerance=float(os.environ.get("SHAP_ADDITIVITY_TOLERANCE", "0.00001")),
+        reason_rule_version=os.environ.get("REASON_RULE_VERSION", REASON_RULE_VERSION),
+    )
+    _LAZY_CPR_APP = create_cpr_wsgi_app(predictor)
     return _LAZY_CPR_APP
 
 
+def _ensure_cpr_app_loaded() -> Callable[..., list[bytes]]:
+    if _LAZY_CPR_APP is None:
+        with _LAZY_CPR_LOCK:
+            return _load_cpr_app_locked()
+    return _LAZY_CPR_APP
+
+
+def _background_load_worker() -> None:
+    global _BG_LOAD_ERROR
+    try:
+        with _LAZY_CPR_LOCK:
+            _load_cpr_app_locked()
+    except Exception as exc:  # noqa: BLE001
+        with _LAZY_CPR_LOCK:
+            _BG_LOAD_ERROR = exc
+
+
+def _start_background_load_if_needed() -> None:
+    global _BG_LOAD_THREAD
+    with _LAZY_CPR_LOCK:
+        if _LAZY_CPR_APP is not None or _BG_LOAD_ERROR is not None:
+            return
+        if _BG_LOAD_THREAD is None or not _BG_LOAD_THREAD.is_alive():
+            _BG_LOAD_THREAD = threading.Thread(
+                target=_background_load_worker,
+                name="cpr-bg-model-loader",
+                daemon=True,
+            )
+            _BG_LOAD_THREAD.start()
+
+
 def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> list[bytes]:
-    """Thread-safe lazy Gunicorn WSGI entrypoint with non-blocking health checks."""
+    """Thread-safe lazy Gunicorn WSGI entrypoint with readiness-gated GCS health checks."""
     path = environ.get("PATH_INFO", "/")
     method = environ.get("REQUEST_METHOD", "GET").upper()
 
     if path in ("/health", "/healthz") and method == "GET":
         if _LAZY_CPR_APP is not None:
             return _LAZY_CPR_APP(environ, start_response)
+        if _BG_LOAD_ERROR is not None:
+            body = json.dumps({"status": "error", "error": str(_BG_LOAD_ERROR)}).encode("utf-8")
+            start_response("500 Internal Server Error", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
+            return [body]
+
         try:
             model_source, _, _ = _validate_cpr_env()
         except Exception as exc:  # noqa: BLE001
@@ -436,12 +484,19 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
             return [body]
 
         if model_source.startswith("gs://"):
+            _start_background_load_if_needed()
+            if _LAZY_CPR_APP is not None:
+                return _LAZY_CPR_APP(environ, start_response)
+            if _BG_LOAD_ERROR is not None:
+                body = json.dumps({"status": "error", "error": str(_BG_LOAD_ERROR)}).encode("utf-8")
+                start_response("500 Internal Server Error", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
+                return [body]
             body = json.dumps({
-                "status": "healthy",
+                "status": "loading",
                 "model_loaded": False,
                 "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
             }).encode("utf-8")
-            start_response("200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
+            start_response("503 Service Unavailable", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
             return [body]
 
     app_fn = _ensure_cpr_app_loaded()

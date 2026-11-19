@@ -238,6 +238,11 @@ def find_repo_root(path: Path) -> Path | None:
     for candidate in (current, *current.parents):
         if (candidate / ".git").exists():
             return candidate
+    for candidate in current.parents:
+        if candidate == candidate.parent:
+            break
+        if candidate.name in ("stages", "foundation", "data"):
+            return candidate.parent
     return None
 
 
@@ -503,6 +508,11 @@ def find_repo_root(path: Path) -> Path | None:
     for candidate in (current, *current.parents):
         if (candidate / ".git").exists():
             return candidate
+    for candidate in current.parents:
+        if candidate == candidate.parent:
+            break
+        if candidate.name in ("stages", "foundation", "data"):
+            return candidate.parent
     return None
 
 

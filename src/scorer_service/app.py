@@ -140,21 +140,18 @@ def resolve_psc_endpoint_ip(
     force_refresh: bool = False,
     ttl_seconds: float = _PSC_CACHE_TTL_SECONDS,
 ) -> str:
-    """Resolve PSC endpoint IP from env, TTL cache, or Vertex control-plane metadata."""
+    """Resolve PSC endpoint IP from TTL cache, env var, or Vertex control-plane metadata."""
     env_ip = config.vertex_psc_endpoint_ip.strip()
-    if not force_refresh and env_ip:
-        return env_ip
-
     key = _psc_cache_key(config)
     with _PSC_DISCOVERY_LOCK:
         if not force_refresh:
-            if env_ip:
-                return env_ip
             cached = _PSC_CACHE.get(key)
             if cached is not None:
                 cached_ip, cached_at = cached
                 if cached_ip and (time.monotonic() - cached_at) < ttl_seconds:
                     return cached_ip
+            if env_ip:
+                return env_ip
 
         fetcher = endpoint_metadata_fetcher or _default_endpoint_metadata_fetcher
         endpoint_doc = fetcher(config)
