@@ -26,6 +26,7 @@ Run `scripts/link-stages.sh` to import non-sensitive outputs from `gcp-foundatio
 
 ```bash
 ./scripts/link-stages.sh --env dev \
+  --from-local ../gcp-foundation/data/enterprise/03-data-science \
   ../gcp-foundation/foundation/02-security-network \
   ../gcp-foundation/data/enterprise/01-platform \
   ../gcp-foundation/data/enterprise/02-governance-ops \
@@ -64,7 +65,7 @@ Choose Track A, Track B, or both inside `stages/enterprise/envs/<env>.tfvars`.
 | Online Store Toggle | `enable_online_feature_store` | `false` | Uses Bigtable autoscaling; blocked in `asia-southeast2` |
 | Online Store Nodes | `feature_online_store_min_nodes` | `1` | Scale up to `feature_online_store_max_nodes` (`2`) |
 | Feature Sync Cron | `feature_sync_cron` | `"TZ=Asia/Singapore 0 * * * *"` | Cron schedule syncing FeatureView from BigQuery |
-| Source Feature Table | `feature_group_source_table` | `"ml_customer_features"` | Silver table with `customer_id` entity key |
+| Source Feature Table | `feature_group_source_table` | `"ml_customer_features"` | Silver table with `entity_id` key |
 
 ---
 

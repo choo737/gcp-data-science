@@ -92,6 +92,13 @@ while [ "$#" -gt 0 ]; do
       gcs_uri="$1"
       shift
       ;;
+    --from-local)
+      if [ "$mode" != "local" ]; then
+        usage
+        exit 1
+      fi
+      shift
+      ;;
     --from-gcs)
       if [ "$mode" != "local" ]; then
         usage
@@ -226,22 +233,38 @@ def resolve_env_gcs_uri(uri: str, env: str) -> str:
     return f"gs://{bucket}/{env}/{filename}"
 
 
+def find_repo_root(path: Path) -> Path | None:
+    current = path.resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
 def resolve_backend_prefix(raw_src: str, src_abs: Path, env: str) -> str:
+    resolved = src_abs.resolve()
     try:
-        rel_stage = src_abs.resolve().relative_to(repo_root).as_posix()
+        rel_stage = resolved.relative_to(repo_root).as_posix()
+        in_self_repo = True
     except ValueError:
-        cleaned = raw_src.rstrip("/")
-        if cleaned.startswith("./"):
-            cleaned = cleaned[2:]
-        if Path(raw_src).is_absolute():
-            rel_stage = f"stages/{src_abs.name}" if src_abs.parent.name == "stages" else src_abs.name
+        in_self_repo = False
+        external_root = find_repo_root(resolved)
+        if external_root is not None:
+            rel_stage = resolved.relative_to(external_root).as_posix()
         else:
-            rel_stage = cleaned
+            cleaned = raw_src.rstrip("/")
+            while cleaned.startswith("../") or cleaned.startswith("./"):
+                cleaned = cleaned[3:] if cleaned.startswith("../") else cleaned[2:]
+            rel_stage = cleaned or resolved.name
     if rel_stage.startswith("stages/"):
         rel_stage = rel_stage[len("stages/"):]
+    if in_self_repo:
+        if domain_name:
+            return f"data-science/{domain_name}/{rel_stage}/{env}"
+        return f"data-science/{rel_stage}/{env}"
     if domain_name:
-        return f"data-science/{domain_name}/{rel_stage}/{env}"
-    return f"data-science/{rel_stage}/{env}"
+        return f"{domain_name}/{rel_stage}/{env}"
+    return f"{rel_stage}/{env}"
 
 
 def read_stage_outputs(raw_src: str, env: str, state_bucket: str) -> dict[str, object]:
@@ -468,22 +491,38 @@ var_re = re.compile(r'^\s*variable\s+"([A-Za-z0-9_]+)"\s*\{', re.MULTILINE)
 declared_vars = set(var_re.findall((target_dir / "variables.tf").read_text(encoding="utf-8")))
 
 
+def find_repo_root(path: Path) -> Path | None:
+    current = path.resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
 def resolve_backend_prefix(raw_src: str, src_abs: Path, env: str) -> str:
+    resolved = src_abs.resolve()
     try:
-        rel_stage = src_abs.resolve().relative_to(repo_root).as_posix()
+        rel_stage = resolved.relative_to(repo_root).as_posix()
+        in_self_repo = True
     except ValueError:
-        cleaned = raw_src.rstrip("/")
-        if cleaned.startswith("./"):
-            cleaned = cleaned[2:]
-        if Path(raw_src).is_absolute():
-            rel_stage = f"stages/{src_abs.name}" if src_abs.parent.name == "stages" else src_abs.name
+        in_self_repo = False
+        external_root = find_repo_root(resolved)
+        if external_root is not None:
+            rel_stage = resolved.relative_to(external_root).as_posix()
         else:
-            rel_stage = cleaned
+            cleaned = raw_src.rstrip("/")
+            while cleaned.startswith("../") or cleaned.startswith("./"):
+                cleaned = cleaned[3:] if cleaned.startswith("../") else cleaned[2:]
+            rel_stage = cleaned or resolved.name
     if rel_stage.startswith("stages/"):
         rel_stage = rel_stage[len("stages/"):]
+    if in_self_repo:
+        if domain_name:
+            return f"data-science/{domain_name}/{rel_stage}/{env}"
+        return f"data-science/{rel_stage}/{env}"
     if domain_name:
-        return f"data-science/{domain_name}/{rel_stage}/{env}"
-    return f"data-science/{rel_stage}/{env}"
+        return f"{domain_name}/{rel_stage}/{env}"
+    return f"{rel_stage}/{env}"
 
 
 def read_stage_outputs(raw_src: str, env: str, state_bucket: str) -> dict[str, object]:

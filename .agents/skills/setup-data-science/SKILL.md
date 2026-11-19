@@ -46,6 +46,7 @@ For Greenfield deployments, link upstream `gcp-foundation` outputs into `00_link
 
 ```bash
 ./scripts/link-stages.sh --env dev \
+  --from-local ../gcp-foundation/data/enterprise/03-data-science \
   ../gcp-foundation/foundation/02-security-network \
   ../gcp-foundation/data/enterprise/01-platform \
   ../gcp-foundation/data/enterprise/02-governance-ops \

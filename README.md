@@ -69,7 +69,7 @@ Complete [QUESTIONNAIRE.md](QUESTIONNAIRE.md) to select tracks and thresholds.
 
 ```bash
 # Greenfield Day-1 link from gcp-foundation GCS export:
-./scripts/link-stages.sh --env prod --from-gcs gs://example-platform-state/foundation-prod.json stages/enterprise
+./scripts/link-stages.sh --env prod --from-gcs gs://example-platform-state/foundation-outputs.json stages/enterprise
 
 # Initialize remote state and deploy an environment:
 cp stages/enterprise/envs/prod.tfvars.example stages/enterprise/envs/prod.tfvars
@@ -120,7 +120,7 @@ Verify gcloud auth, link stages/enterprise, deploy dev or staging, and run audit
 - `assets/`: Cloud City Layer 04 visual architecture plate.
 - `modules/ds/`: Five-file Terraform modules (`feature-store`, `xai-serving-endpoint`, `bqml-xai-pipeline`).
 - `stages/sandbox/`: Single-project stage with GCS backend and committed `.terraform.lock.hcl`.
-- `stages/enterprise/`: Locked 32-variable multi-project stage with `envs/{dev,staging,prod}.tfvars.example`.
+- `stages/enterprise/`: Locked 35-variable multi-project stage with `envs/{dev,staging,prod}.tfvars.example`.
 - `src/cpr_treeshap/`: Exact `OMP_NUM_THREADS=1` XGBoost TreeSHAP Vertex AI CPR predictor.
 - `src/scorer_service/`: Fail-closed Cloud Run v2 scorer and BigQuery Storage Write API ledger writer.
 - `src/mrm_validation/`: Challenger gate computing ROC-AUC, KS, disparate impact, and `model_card.json`.

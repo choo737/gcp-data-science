@@ -143,6 +143,12 @@ jobs:
           else
             terraform -chdir=stages/enterprise apply -auto-approve
           fi
+          cpr_job_name="$(terraform -chdir=stages/enterprise output -raw cpr_deployer_job_name 2>/dev/null || true)"
+          if [ -n "${cpr_job_name}" ]; then
+            deploy_region="$(terraform -chdir=stages/enterprise output -raw region)"
+            ml_ops_project="$(terraform -chdir=stages/enterprise output -raw ml_ops_project_id)"
+            gcloud run jobs execute "${cpr_job_name}" --region "${deploy_region}" --project "${ml_ops_project}" --wait
+          fi
           if [ -n "${IAC_OUTPUTS_BUCKET}" ]; then
             if [ -n "${DOMAIN_NAME}" ]; then
               ./scripts/link-stages.sh --env dev --domain-name "${DOMAIN_NAME}" --tfstate-bucket "${TF_STATE_BUCKET}" \
@@ -238,6 +244,12 @@ jobs:
           else
             terraform -chdir=stages/enterprise apply -auto-approve
           fi
+          cpr_job_name="$(terraform -chdir=stages/enterprise output -raw cpr_deployer_job_name 2>/dev/null || true)"
+          if [ -n "${cpr_job_name}" ]; then
+            deploy_region="$(terraform -chdir=stages/enterprise output -raw region)"
+            ml_ops_project="$(terraform -chdir=stages/enterprise output -raw ml_ops_project_id)"
+            gcloud run jobs execute "${cpr_job_name}" --region "${deploy_region}" --project "${ml_ops_project}" --wait
+          fi
           if [ -n "${IAC_OUTPUTS_BUCKET}" ]; then
             if [ -n "${DOMAIN_NAME}" ]; then
               ./scripts/link-stages.sh --env staging --domain-name "${DOMAIN_NAME}" --tfstate-bucket "${TF_STATE_BUCKET}" \
@@ -272,10 +284,16 @@ jobs:
       - name: Run MRM validation suite
         env:
           MRM_EVAL_INPUT_JSON: ${{ vars.MRM_EVAL_INPUT_JSON || '' }}
+          ALLOW_INFRA_ONLY_PROD_APPLY: ${{ vars.ALLOW_INFRA_ONLY_PROD_APPLY || 'false' }}
         run: |
           python3 -m unittest discover -s tests -v
           if [ -n "${MRM_EVAL_INPUT_JSON}" ] && [ -f "${MRM_EVAL_INPUT_JSON}" ]; then
             python3 -m src.mrm_validation.evaluate_gate --input-json "${MRM_EVAL_INPUT_JSON}" --output-card model_card.json
+          elif [ "${ALLOW_INFRA_ONLY_PROD_APPLY}" = "true" ]; then
+            echo "ALLOW_INFRA_ONLY_PROD_APPLY=true; skipping model_card gate for infra-only prod apply."
+          else
+            echo "ERROR: MRM_EVAL_INPUT_JSON is missing or unreadable; prod apply blocked (fail-closed)." >&2
+            exit 1
           fi
 
   apply-prod:
@@ -360,6 +378,12 @@ jobs:
             terraform -chdir=stages/enterprise apply -auto-approve -var-file=envs/prod.tfvars
           else
             terraform -chdir=stages/enterprise apply -auto-approve
+          fi
+          cpr_job_name="$(terraform -chdir=stages/enterprise output -raw cpr_deployer_job_name 2>/dev/null || true)"
+          if [ -n "${cpr_job_name}" ]; then
+            deploy_region="$(terraform -chdir=stages/enterprise output -raw region)"
+            ml_ops_project="$(terraform -chdir=stages/enterprise output -raw ml_ops_project_id)"
+            gcloud run jobs execute "${cpr_job_name}" --region "${deploy_region}" --project "${ml_ops_project}" --wait
           fi
           if [ -n "${IAC_OUTPUTS_BUCKET}" ]; then
             if [ -n "${DOMAIN_NAME}" ]; then

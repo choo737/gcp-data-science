@@ -1,4 +1,4 @@
-"""Synchronous BigQuery Storage Write API COMMITTED-stream ledger writer."""
+"""Synchronous BigQuery Storage Write API _default-stream Protobuf ledger writer."""
 
 from __future__ import annotations
 
@@ -34,6 +34,34 @@ RESTRICTED_PII_KEYS: frozenset[str] = frozenset({
     "passport_number",
 })
 
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_STRING_FIELDS: frozenset[str] = frozenset({
+    "decision_id",
+    "entity_id",
+    "serving_track",
+    "model_id",
+    "model_version_id",
+    "model_artifact_sha256",
+    "container_image_digest",
+    "schema_version",
+    "explained_class",
+    "reason_rule_version",
+})
+_DOUBLE_FIELDS: frozenset[str] = frozenset({
+    "approve_prob",
+    "raw_margin",
+    "base_logit",
+    "shap_sum_logit",
+})
+_JSON_FIELDS: frozenset[str] = frozenset({
+    "shap_logit_map",
+    "top_adverse_reasons",
+    "feature_payload",
+})
+
+_CACHED_DESCRIPTOR_PROTO: Any = None
+_CACHED_ROW_CLASS: Any = None
+
 
 class LedgerCommitError(RuntimeError):
     """Raised when synchronous XAI audit ledger persistence fails."""
@@ -41,14 +69,103 @@ class LedgerCommitError(RuntimeError):
 
 def _serialize_json_field(value: Any) -> str:
     if isinstance(value, str):
-        # Validate JSON string is well-formed before writing to a BigQuery JSON column.
-        json.loads(value)
+        parsed = json.loads(value)
+        return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _to_epoch_micros(value: Any) -> int:
+    """Convert ISO-8601 string, datetime, or integer microseconds to UTC epoch microseconds."""
+    if isinstance(value, bool):
+        raise ValueError("decision_timestamp cannot be a bool.")
+    if isinstance(value, int):
         return value
-    return json.dumps(value, sort_keys=True)
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            raise ValueError("decision_timestamp cannot be empty.")
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        raise ValueError(f"Unsupported decision_timestamp type: {type(value).__name__}")
+    delta = dt.astimezone(timezone.utc) - _EPOCH_UTC
+    return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _build_ledger_proto_schema() -> tuple[Any, Any]:
+    """Build and cache a self-contained proto2 DescriptorProto and message class."""
+    global _CACHED_DESCRIPTOR_PROTO, _CACHED_ROW_CLASS
+    if _CACHED_DESCRIPTOR_PROTO is not None and _CACHED_ROW_CLASS is not None:
+        return _CACHED_DESCRIPTOR_PROTO, _CACHED_ROW_CLASS
+
+    from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+
+    file_proto = descriptor_pb2.FileDescriptorProto()
+    file_proto.name = "ml_xai_audit_ledger_row.proto"
+    file_proto.syntax = "proto2"
+
+    msg_proto = file_proto.message_type.add()
+    msg_proto.name = "MlXaiAuditLedgerRow"
+
+    for number, col_name in enumerate(LOCKED_LEDGER_COLUMNS, start=1):
+        field = msg_proto.field.add()
+        field.name = col_name
+        field.number = number
+        field.label = descriptor_pb2.FieldDescriptorProto.LABEL_REQUIRED
+        if col_name == "decision_timestamp":
+            field.type = descriptor_pb2.FieldDescriptorProto.TYPE_INT64
+        elif col_name in _DOUBLE_FIELDS:
+            field.type = descriptor_pb2.FieldDescriptorProto.TYPE_DOUBLE
+        else:
+            field.type = descriptor_pb2.FieldDescriptorProto.TYPE_STRING
+
+    pool = descriptor_pool.DescriptorPool()
+    pool.AddSerializedFile(file_proto.SerializeToString())
+    msg_descriptor = pool.FindMessageTypeByName("MlXaiAuditLedgerRow")
+    row_class = message_factory.GetMessageClass(msg_descriptor)
+
+    descriptor_copy = descriptor_pb2.DescriptorProto()
+    descriptor_copy.CopyFrom(msg_proto)
+    _CACHED_DESCRIPTOR_PROTO = descriptor_copy
+    _CACHED_ROW_CLASS = row_class
+    return _CACHED_DESCRIPTOR_PROTO, _CACHED_ROW_CLASS
+
+
+def get_ledger_row_descriptor_proto() -> Any:
+    """Return a copy of the self-contained proto2 DescriptorProto for MlXaiAuditLedgerRow."""
+    descriptor_proto, _ = _build_ledger_proto_schema()
+    return descriptor_proto
+
+
+def serialize_ledger_row_proto(row: Mapping[str, Any]) -> bytes:
+    """Serialize one 18-column audit row into Protobuf wire bytes."""
+    _, row_class = _build_ledger_proto_schema()
+    kwargs: dict[str, Any] = {}
+    for col_name in LOCKED_LEDGER_COLUMNS:
+        if col_name not in row:
+            raise LedgerCommitError(f"Cannot serialize incomplete ledger row: missing {col_name}")
+        val = row[col_name]
+        if col_name == "decision_timestamp":
+            kwargs[col_name] = _to_epoch_micros(val)
+        elif col_name in _DOUBLE_FIELDS:
+            kwargs[col_name] = float(val)
+        elif col_name in _JSON_FIELDS:
+            kwargs[col_name] = _serialize_json_field(val)
+        elif col_name in _STRING_FIELDS:
+            kwargs[col_name] = str(val)
+        else:
+            kwargs[col_name] = str(val)
+    msg = row_class(**kwargs)
+    return msg.SerializeToString()
 
 
 class FailClosedLedgerWriter:
-    """Commits 18-column XAI ledger rows synchronously before decision release."""
+    """Commits 18-column XAI ledger rows synchronously to BigQuery Storage Write _default stream."""
 
     def __init__(
         self,
@@ -71,6 +188,10 @@ class FailClosedLedgerWriter:
     @property
     def table_parent(self) -> str:
         return f"projects/{self.project_id}/datasets/{self.dataset_id}/tables/{self.table_id}"
+
+    @property
+    def default_write_stream(self) -> str:
+        return f"{self.table_parent}/streams/_default"
 
     def _get_write_client(self) -> Any:
         if self._write_client is None:
@@ -140,33 +261,29 @@ class FailClosedLedgerWriter:
         try:
             from google.cloud.bigquery_storage_v1 import types  # type: ignore
 
-            proto_rows = types.AppendRowsRequest.ProtoData()
-            proto_rows.rows.serialized_rows.append(json.dumps(row).encode("utf-8"))
+            descriptor_proto = get_ledger_row_descriptor_proto()
+            serialized_row = serialize_ledger_row_proto(row)
+
             req = types.AppendRowsRequest()
             req.write_stream = stream_name
-            req.proto_rows = proto_rows
+            req.proto_rows.writer_schema.proto_descriptor.CopyFrom(descriptor_proto)
+            req.proto_rows.rows.serialized_rows.append(serialized_row)
             return req
         except ImportError:
-            return {"write_stream": stream_name, "rows": [dict(row)]}
+            return {
+                "write_stream": stream_name,
+                "rows": [dict(row)],
+            }
 
     def commit_row_sync(self, row: Mapping[str, Any]) -> str:
-        """Persist one audit row synchronously on a COMMITTED BigQuery write stream."""
+        """Persist one audit row synchronously on the BigQuery _default write stream."""
         missing = [col for col in LOCKED_LEDGER_COLUMNS if col not in row]
         if missing:
             raise LedgerCommitError(f"Cannot commit incomplete ledger row: {missing}")
 
         client = self._get_write_client()
         try:
-            try:
-                from google.cloud.bigquery_storage_v1 import types  # type: ignore
-
-                write_stream = types.WriteStream(type_=types.WriteStream.Type.COMMITTED)
-            except ImportError:
-                write_stream = {"type_": "COMMITTED"}
-
-            created = client.create_write_stream(parent=self.table_parent, write_stream=write_stream)
-            stream_name = getattr(created, "name", None) or created["name"]
-            request = self._build_append_request(stream_name, row)
+            request = self._build_append_request(self.default_write_stream, row)
             responses = list(client.append_rows(iter([request])))
             if not responses:
                 raise LedgerCommitError("BigQuery Storage Write API returned zero append responses.")
@@ -179,7 +296,7 @@ class FailClosedLedgerWriter:
                 err = getattr(resp, "error", None)
                 if err is None and isinstance(resp, Mapping):
                     err = resp.get("error")
-                if err and getattr(err, "code", 0) != 0:
+                if err is not None and getattr(err, "code", 0) != 0:
                     raise LedgerCommitError(f"BigQuery Storage Write API stream error: {err}")
         except LedgerCommitError:
             raise

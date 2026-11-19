@@ -12,6 +12,20 @@ data "google_project" "current" {
   project_id = var.project_id
 }
 
+data "google_storage_project_service_account" "gcs_account" {
+  count   = local.use_cmek && var.manage_kms_iam ? 1 : 0
+  project = var.project_id
+
+  depends_on = [time_sleep.api_propagation]
+}
+
+data "google_bigquery_default_service_account" "bq_account" {
+  count   = local.use_cmek && var.manage_kms_iam ? 1 : 0
+  project = var.project_id
+
+  depends_on = [time_sleep.api_propagation]
+}
+
 locals {
   propagation_wait_seconds = "20s"
   dataset_prefix           = replace(lower(var.prefix), "-", "_")
@@ -21,6 +35,9 @@ locals {
   effective_audit_ds       = local.raw_audit_ds != "" ? local.raw_audit_ds : "${local.dataset_prefix}_ml_xai_audit"
   effective_kms_key_id     = var.kms_key_id != null ? trimspace(var.kms_key_id) : ""
   use_cmek                 = local.effective_kms_key_id != ""
+  effective_vpc_id         = var.vpc_id != null ? trimspace(var.vpc_id) : ""
+  effective_subnet_id      = var.egress_connector_subnet_id != null ? trimspace(var.egress_connector_subnet_id) : ""
+  use_direct_vpc           = local.effective_vpc_id != "" && local.effective_subnet_id != ""
   enable_online_track      = contains(["vertex_cpr_online", "both"], var.ds_serving_track)
   enable_bqml_track        = contains(["bqml_batch", "both"], var.ds_serving_track)
 
@@ -33,13 +50,15 @@ locals {
   required_apis = toset(concat(
     [
       "aiplatform.googleapis.com",
+      "artifactregistry.googleapis.com",
       "bigquery.googleapis.com",
       "bigquerystorage.googleapis.com",
       "iam.googleapis.com",
     ],
     local.enable_online_track && var.enable_scorer_service ? ["run.googleapis.com"] : [],
-    local.enable_bqml_track ? ["workflows.googleapis.com", "workflowexecutions.googleapis.com"] : [],
+    local.enable_bqml_track ? ["workflows.googleapis.com", "workflowexecutions.googleapis.com", "pubsub.googleapis.com"] : [],
     local.enable_bqml_track && var.enable_bqml_schedule ? ["cloudscheduler.googleapis.com"] : [],
+    local.use_direct_vpc ? ["networkconnectivity.googleapis.com"] : [],
     length(var.alert_notification_channel_ids) > 0 ? ["monitoring.googleapis.com"] : [],
   ))
 
@@ -63,6 +82,14 @@ locals {
     { name = "feature_payload", type = "JSON", mode = "REQUIRED", description = "Non-PII input feature vector evaluated at scoring time." },
     { name = "reason_rule_version", type = "STRING", mode = "REQUIRED", description = "Adverse-action reason mapping rule version." },
   ])
+
+  ml_training_labels_schema = jsonencode([
+    { name = "application_id", type = "STRING", mode = "REQUIRED", description = "Unique credit application identifier." },
+    { name = "entity_id", type = "STRING", mode = "REQUIRED", description = "Scored customer or entity identifier." },
+    { name = "label_timestamp", type = "TIMESTAMP", mode = "REQUIRED", description = "UTC timestamp when ground-truth outcome was observed." },
+    { name = "approved_flag", type = "INT64", mode = "REQUIRED", description = "Binary ground-truth approval outcome (1 = approved, 0 = rejected)." },
+    { name = "demographic_group", type = "STRING", mode = "NULLABLE", description = "Protected fairness evaluation subgroup attribute." },
+  ])
 }
 
 resource "google_project_service" "apis" {
@@ -77,6 +104,169 @@ resource "time_sleep" "api_propagation" {
   create_duration = local.propagation_wait_seconds
 
   depends_on = [google_project_service.apis]
+}
+
+resource "google_project_service_identity" "aiplatform_agent" {
+  count    = local.use_cmek && var.manage_kms_iam ? 1 : 0
+  provider = google-beta
+  project  = var.project_id
+  service  = "aiplatform.googleapis.com"
+
+  depends_on = [time_sleep.api_propagation]
+}
+
+resource "google_project_service_identity" "run_agent" {
+  count    = local.use_cmek && var.manage_kms_iam && local.enable_online_track && var.enable_scorer_service ? 1 : 0
+  provider = google-beta
+  project  = var.project_id
+  service  = "run.googleapis.com"
+
+  depends_on = [time_sleep.api_propagation]
+}
+
+resource "google_project_service_identity" "workflows_agent" {
+  count    = local.use_cmek && var.manage_kms_iam && local.enable_bqml_track ? 1 : 0
+  provider = google-beta
+  project  = var.project_id
+  service  = "workflows.googleapis.com"
+
+  depends_on = [time_sleep.api_propagation]
+}
+
+resource "google_project_service_identity" "pubsub_agent" {
+  count    = local.use_cmek && var.manage_kms_iam && local.enable_bqml_track ? 1 : 0
+  provider = google-beta
+  project  = var.project_id
+  service  = "pubsub.googleapis.com"
+
+  depends_on = [time_sleep.api_propagation]
+}
+
+resource "google_project_service_identity" "artifactregistry_agent" {
+  count    = local.use_cmek && var.manage_kms_iam ? 1 : 0
+  provider = google-beta
+  project  = var.project_id
+  service  = "artifactregistry.googleapis.com"
+
+  depends_on = [time_sleep.api_propagation]
+}
+
+resource "time_sleep" "service_identity_propagation" {
+  count           = local.use_cmek && var.manage_kms_iam ? 1 : 0
+  create_duration = local.propagation_wait_seconds
+
+  depends_on = [
+    google_project_service_identity.aiplatform_agent,
+    google_project_service_identity.run_agent,
+    google_project_service_identity.workflows_agent,
+    google_project_service_identity.pubsub_agent,
+    google_project_service_identity.artifactregistry_agent,
+    data.google_storage_project_service_account.gcs_account,
+    data.google_bigquery_default_service_account.bq_account,
+  ]
+}
+
+resource "google_kms_crypto_key_iam_member" "aiplatform_cmek" {
+  count = local.use_cmek && var.manage_kms_iam ? 1 : 0
+
+  crypto_key_id = local.effective_kms_key_id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = google_project_service_identity.aiplatform_agent[0].member
+
+  depends_on = [time_sleep.service_identity_propagation]
+}
+
+resource "google_kms_crypto_key_iam_member" "run_cmek" {
+  count = local.use_cmek && var.manage_kms_iam && local.enable_online_track && var.enable_scorer_service ? 1 : 0
+
+  crypto_key_id = local.effective_kms_key_id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = google_project_service_identity.run_agent[0].member
+
+  depends_on = [time_sleep.service_identity_propagation]
+}
+
+resource "google_kms_crypto_key_iam_member" "workflows_cmek" {
+  count = local.use_cmek && var.manage_kms_iam && local.enable_bqml_track ? 1 : 0
+
+  crypto_key_id = local.effective_kms_key_id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = google_project_service_identity.workflows_agent[0].member
+
+  depends_on = [time_sleep.service_identity_propagation]
+}
+
+resource "google_kms_crypto_key_iam_member" "pubsub_cmek" {
+  count = local.use_cmek && var.manage_kms_iam && local.enable_bqml_track ? 1 : 0
+
+  crypto_key_id = local.effective_kms_key_id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = google_project_service_identity.pubsub_agent[0].member
+
+  depends_on = [time_sleep.service_identity_propagation]
+}
+
+resource "google_kms_crypto_key_iam_member" "artifactregistry_cmek" {
+  count = local.use_cmek && var.manage_kms_iam ? 1 : 0
+
+  crypto_key_id = local.effective_kms_key_id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = google_project_service_identity.artifactregistry_agent[0].member
+
+  depends_on = [time_sleep.service_identity_propagation]
+}
+
+resource "google_kms_crypto_key_iam_member" "gcs_cmek" {
+  count = local.use_cmek && var.manage_kms_iam ? 1 : 0
+
+  crypto_key_id = local.effective_kms_key_id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = data.google_storage_project_service_account.gcs_account[0].member
+
+  depends_on = [time_sleep.service_identity_propagation]
+}
+
+resource "google_kms_crypto_key_iam_member" "bq_cmek" {
+  count = local.use_cmek && var.manage_kms_iam ? 1 : 0
+
+  crypto_key_id = local.effective_kms_key_id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = data.google_bigquery_default_service_account.bq_account[0].member
+
+  depends_on = [time_sleep.service_identity_propagation]
+}
+
+resource "time_sleep" "cmek_propagation" {
+  count = local.use_cmek ? 1 : 0
+
+  create_duration = local.propagation_wait_seconds
+
+  depends_on = [
+    google_kms_crypto_key_iam_member.aiplatform_cmek,
+    google_kms_crypto_key_iam_member.run_cmek,
+    google_kms_crypto_key_iam_member.workflows_cmek,
+    google_kms_crypto_key_iam_member.pubsub_cmek,
+    google_kms_crypto_key_iam_member.artifactregistry_cmek,
+    google_kms_crypto_key_iam_member.gcs_cmek,
+    google_kms_crypto_key_iam_member.bq_cmek,
+  ]
+}
+
+resource "google_network_connectivity_service_connection_policy" "vertex_psc" {
+  count = local.use_direct_vpc ? 1 : 0
+
+  project       = var.project_id
+  name          = "${replace(lower(var.prefix), "_", "-")}-vertex-psc-policy"
+  location      = var.region
+  service_class = "gcp-vertexai"
+  network       = local.effective_vpc_id
+  labels        = local.effective_labels
+
+  psc_config {
+    subnetworks = [local.effective_subnet_id]
+  }
+
+  depends_on = [time_sleep.api_propagation]
 }
 
 resource "google_bigquery_dataset" "silver" {
@@ -97,7 +287,10 @@ resource "google_bigquery_dataset" "silver" {
     }
   }
 
-  depends_on = [time_sleep.api_propagation]
+  depends_on = [
+    time_sleep.api_propagation,
+    time_sleep.cmek_propagation,
+  ]
 }
 
 resource "google_bigquery_dataset" "ml_audit" {
@@ -118,18 +311,22 @@ resource "google_bigquery_dataset" "ml_audit" {
     }
   }
 
-  depends_on = [time_sleep.api_propagation]
+  depends_on = [
+    time_sleep.api_propagation,
+    time_sleep.cmek_propagation,
+  ]
 }
 
 resource "google_bigquery_table" "ml_xai_audit_ledger" {
-  project             = var.project_id
-  dataset_id          = local.effective_audit_ds
-  table_id            = var.ml_audit_table_id
-  description         = "Sandbox 18-column XAI decision and TreeSHAP audit ledger."
-  deletion_protection = !var.delete_contents_on_destroy
-  clustering          = ["serving_track", "model_id", "entity_id"]
-  schema              = local.ml_xai_audit_ledger_schema
-  labels              = local.effective_labels
+  project                  = var.project_id
+  dataset_id               = local.effective_audit_ds
+  table_id                 = var.ml_audit_table_id
+  description              = "Sandbox 18-column XAI decision and TreeSHAP audit ledger."
+  require_partition_filter = true
+  deletion_protection      = !var.delete_contents_on_destroy
+  clustering               = ["serving_track", "model_id", "explained_class", "entity_id"]
+  schema                   = local.ml_xai_audit_ledger_schema
+  labels                   = local.effective_labels
 
   time_partitioning {
     type  = "DAY"
@@ -145,6 +342,37 @@ resource "google_bigquery_table" "ml_xai_audit_ledger" {
 
   depends_on = [
     time_sleep.api_propagation,
+    time_sleep.cmek_propagation,
+    google_bigquery_dataset.ml_audit,
+  ]
+}
+
+resource "google_bigquery_table" "ml_training_labels" {
+  project                  = var.project_id
+  dataset_id               = local.effective_audit_ds
+  table_id                 = "ml_training_labels"
+  description              = "Point-in-time ground-truth credit approval labels for Track A and Track B training."
+  require_partition_filter = true
+  deletion_protection      = !var.delete_contents_on_destroy
+  clustering               = ["entity_id", "approved_flag"]
+  schema                   = local.ml_training_labels_schema
+  labels                   = local.effective_labels
+
+  time_partitioning {
+    type  = "DAY"
+    field = "label_timestamp"
+  }
+
+  dynamic "encryption_configuration" {
+    for_each = local.use_cmek ? [local.effective_kms_key_id] : []
+    content {
+      kms_key_name = encryption_configuration.value
+    }
+  }
+
+  depends_on = [
+    time_sleep.api_propagation,
+    time_sleep.cmek_propagation,
     google_bigquery_dataset.ml_audit,
   ]
 }
@@ -169,6 +397,7 @@ module "feature_store" {
 
   depends_on = [
     time_sleep.api_propagation,
+    time_sleep.cmek_propagation,
     google_bigquery_dataset.silver,
   ]
 }
@@ -188,17 +417,22 @@ module "xai_serving_endpoint" {
   scorer_container_image     = var.scorer_container_image
   deploy_cpr_model           = var.deploy_cpr_model
   cpr_container_image        = var.cpr_container_image
+  cpr_model_artifact_uri     = var.cpr_model_artifact_uri
+  cpr_model_sha256           = var.cpr_model_sha256
   serving_track              = var.ds_serving_track
   shap_additivity_tolerance  = var.shap_additivity_tolerance
   kms_key_id                 = local.effective_kms_key_id
-  vpc_id                     = var.vpc_id
-  egress_connector_subnet_id = var.egress_connector_subnet_id
+  manage_kms_iam             = var.manage_kms_iam
+  vpc_id                     = local.effective_vpc_id
+  egress_connector_subnet_id = local.effective_subnet_id
   delete_contents_on_destroy = var.delete_contents_on_destroy
   labels                     = local.effective_labels
 
   depends_on = [
     time_sleep.api_propagation,
+    time_sleep.cmek_propagation,
     google_bigquery_table.ml_xai_audit_ledger,
+    google_network_connectivity_service_connection_policy.vertex_psc,
   ]
 }
 
@@ -217,12 +451,15 @@ module "bqml_xai_pipeline" {
   enable_bqml_schedule           = var.enable_bqml_schedule
   bqml_schedule_cron             = var.bqml_schedule_cron
   kms_key_id                     = local.effective_kms_key_id
+  manage_kms_iam                 = var.manage_kms_iam
   alert_notification_channel_ids = var.alert_notification_channel_ids
   delete_contents_on_destroy     = var.delete_contents_on_destroy
   labels                         = local.effective_labels
 
   depends_on = [
     time_sleep.api_propagation,
+    time_sleep.cmek_propagation,
     google_bigquery_table.ml_xai_audit_ledger,
+    google_bigquery_table.ml_training_labels,
   ]
 }

@@ -21,6 +21,24 @@ variable "cpr_container_image" {
   description = "Artifact Registry container image URI for the Custom Prediction Routine TreeSHAP predictor."
 }
 
+variable "cpr_model_artifact_uri" {
+  type        = string
+  default     = ""
+  description = "GCS directory or artifact URI hosting the trained XGBoost model.ubj when deploy_cpr_model is true."
+}
+
+variable "cpr_model_sha256" {
+  type        = string
+  default     = ""
+  description = "Expected lowercase hex SHA-256 digest of the CPR XGBoost model artifact."
+}
+
+variable "create_ml_audit_ledger_table" {
+  type        = bool
+  default     = false
+  description = "Create ml_xai_audit_ledger and ml_training_labels in Brownfield deployments without Greenfield 03-data-science."
+}
+
 variable "deploy_cpr_model" {
   type        = bool
   default     = false

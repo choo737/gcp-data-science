@@ -62,6 +62,14 @@ locals {
     { name = "feature_payload", type = "JSON", mode = "REQUIRED", description = "Non-PII input feature vector evaluated at scoring time." },
     { name = "reason_rule_version", type = "STRING", mode = "REQUIRED", description = "Adverse-action reason mapping rule version." },
   ])
+
+  ml_training_labels_schema = jsonencode([
+    { name = "application_id", type = "STRING", mode = "REQUIRED", description = "Unique credit application identifier." },
+    { name = "entity_id", type = "STRING", mode = "REQUIRED", description = "Scored customer or entity identifier." },
+    { name = "label_timestamp", type = "TIMESTAMP", mode = "REQUIRED", description = "UTC timestamp when ground-truth outcome was observed." },
+    { name = "approved_flag", type = "INT64", mode = "REQUIRED", description = "Binary ground-truth approval outcome (1 = approved, 0 = rejected)." },
+    { name = "demographic_group", type = "STRING", mode = "NULLABLE", description = "Protected fairness evaluation subgroup attribute." },
+  ])
 }
 
 data "google_project" "ml_ops" {
@@ -182,18 +190,53 @@ resource "time_sleep" "cmek_propagation" {
 }
 
 resource "google_bigquery_table" "ml_xai_audit_ledger" {
-  project             = var.ml_ops_project_id
-  dataset_id          = var.ml_audit_dataset_id
-  table_id            = var.ml_audit_table_id
-  description         = "Immutable 18-column XAI decision and TreeSHAP audit ledger."
-  deletion_protection = !local.delete_contents_on_destroy
-  clustering          = ["serving_track", "model_id", "entity_id"]
-  schema              = local.ml_xai_audit_ledger_schema
-  labels              = local.effective_labels
+  count = var.create_ml_audit_ledger_table ? 1 : 0
+
+  project                  = var.ml_ops_project_id
+  dataset_id               = var.ml_audit_dataset_id
+  table_id                 = var.ml_audit_table_id
+  description              = "Immutable 18-column XAI decision and TreeSHAP audit ledger."
+  require_partition_filter = true
+  deletion_protection      = !local.delete_contents_on_destroy
+  clustering               = ["serving_track", "model_id", "explained_class", "entity_id"]
+  schema                   = local.ml_xai_audit_ledger_schema
+  labels                   = local.effective_labels
 
   time_partitioning {
     type  = "DAY"
     field = "decision_timestamp"
+  }
+
+  dynamic "encryption_configuration" {
+    for_each = local.use_cmek ? [local.effective_kms_key_id] : []
+    content {
+      kms_key_name = encryption_configuration.value
+    }
+  }
+
+  depends_on = [
+    terraform_data.validate_enterprise_inputs,
+    time_sleep.api_propagation,
+    time_sleep.cmek_propagation,
+  ]
+}
+
+resource "google_bigquery_table" "ml_training_labels" {
+  count = var.create_ml_audit_ledger_table ? 1 : 0
+
+  project                  = var.ml_ops_project_id
+  dataset_id               = var.ml_audit_dataset_id
+  table_id                 = "ml_training_labels"
+  description              = "Point-in-time ground-truth credit approval labels for Track A and Track B training."
+  require_partition_filter = true
+  deletion_protection      = !local.delete_contents_on_destroy
+  clustering               = ["entity_id", "approved_flag"]
+  schema                   = local.ml_training_labels_schema
+  labels                   = local.effective_labels
+
+  time_partitioning {
+    type  = "DAY"
+    field = "label_timestamp"
   }
 
   dynamic "encryption_configuration" {
@@ -264,7 +307,7 @@ module "xai_serving_endpoint" {
   ml_ops_project_id          = var.ml_ops_project_id
   ds_exp_project_id          = var.ds_exp_project_id
   ml_audit_dataset_id        = var.ml_audit_dataset_id
-  ml_audit_table_id          = google_bigquery_table.ml_xai_audit_ledger.table_id
+  ml_audit_table_id          = var.ml_audit_table_id
   ml_worm_bucket_name        = local.effective_worm_bucket
   region                     = var.region
   prefix                     = local.workflow_prefix
@@ -273,6 +316,8 @@ module "xai_serving_endpoint" {
   scorer_container_image     = var.scorer_container_image
   deploy_cpr_model           = var.deploy_cpr_model
   cpr_container_image        = var.cpr_container_image
+  cpr_model_artifact_uri     = var.cpr_model_artifact_uri
+  cpr_model_sha256           = var.cpr_model_sha256
   serving_track              = var.ds_serving_track
   shap_additivity_tolerance  = var.shap_additivity_tolerance
   kms_key_id                 = local.effective_kms_key_id
@@ -299,7 +344,7 @@ module "bqml_xai_pipeline" {
   silver_dataset_id              = var.silver_dataset_id
   feature_group_source_table     = var.feature_group_source_table
   ml_audit_dataset_id            = var.ml_audit_dataset_id
-  ml_audit_table_id              = google_bigquery_table.ml_xai_audit_ledger.table_id
+  ml_audit_table_id              = var.ml_audit_table_id
   region                         = var.region
   prefix                         = local.workflow_prefix
   enable_bqml_schedule           = var.enable_bqml_schedule
@@ -315,5 +360,6 @@ module "bqml_xai_pipeline" {
     time_sleep.service_identity_propagation,
     time_sleep.cmek_propagation,
     google_bigquery_table.ml_xai_audit_ledger,
+    google_bigquery_table.ml_training_labels,
   ]
 }

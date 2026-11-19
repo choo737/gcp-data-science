@@ -24,6 +24,12 @@ variable "feature_group_source_table" {
   description = "BigQuery Silver table or view backing the Feature Group."
 }
 
+variable "entity_id_columns" {
+  type        = list(string)
+  default     = ["entity_id"]
+  description = "Entity ID columns used to key the Vertex AI Feature Group."
+}
+
 variable "region" {
   type        = string
   default     = "asia-southeast1"
@@ -88,19 +94,19 @@ variable "feature_definitions" {
       description = "Customer relationship tenure in completed calendar months."
     }
     avg_monthly_spend = {
-      description = "Trailing twelve-month average monthly spend in reporting currency."
+      description = "Trailing 30-day rolling net transaction volume in reporting currency."
     }
-    delinquency_count_12m = {
-      description = "Count of delinquency events recorded over the trailing twelve months."
+    rolling_order_count = {
+      description = "Verified completed order count in the trailing 30-day window."
     }
-    credit_utilization_ratio = {
-      description = "Current revolving balance divided by total approved credit limit."
+    days_since_last_order = {
+      description = "Calendar days elapsed since the last completed transaction."
     }
-    debt_to_income_ratio = {
-      description = "Total monthly debt obligations divided by verified monthly income."
+    cancellation_rate_30d = {
+      description = "Share of trailing 30-day orders cancelled or reversed."
     }
-    verified_income_band = {
-      description = "Ordinal income verification tier derived in Silver."
+    discount_utilization_ratio = {
+      description = "Promotional discount amount divided by gross trailing 30-day spend."
     }
   }
   description = "Map of feature IDs registered inside the Vertex AI Feature Group."

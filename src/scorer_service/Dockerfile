@@ -12,10 +12,11 @@ RUN printf 'pip==26.3 --hash=sha256:f3b60b20ffaadd4415ed7957212a38ac63fa4c5fa375
     rm -f /tmp/pip.lock && \
     pip install --no-cache-dir --require-hashes --no-deps -r requirements.lock
 
-COPY pyproject.toml __init__.py ledger_writer.py app.py ./
+COPY pyproject.toml ./
+COPY __init__.py ledger_writer.py app.py ./scorer_service/
 
 USER 65532:65532
 
 EXPOSE 8080
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "8", "app:application"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "8", "scorer_service.app:application"]

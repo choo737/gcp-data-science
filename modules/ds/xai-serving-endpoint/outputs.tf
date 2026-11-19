@@ -22,3 +22,13 @@ output "scorer_service_account_email" {
   value       = try(google_service_account.scorer[0].email, "")
   description = "Dedicated service account email used by the XAI scorer service."
 }
+
+output "psc_endpoint_ip" {
+  value       = local.psc_endpoint_ip
+  description = "Private Service Connect endpoint IP when automated or manually configured."
+}
+
+output "cpr_deployer_job_name" {
+  value       = try(google_cloud_run_v2_job.cpr_deployer[0].name, "")
+  description = "Cloud Run v2 job name that uploads and deploys the CPR model when enabled."
+}

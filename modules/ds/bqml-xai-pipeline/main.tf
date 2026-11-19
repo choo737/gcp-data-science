@@ -10,6 +10,21 @@ locals {
   workflow_source       = file("${path.module}/../../../workflows/bqml_xai_pipeline.workflows.yaml")
 }
 
+resource "google_project_service_identity" "pubsub_agent" {
+  count    = local.effective_kms_key_id != "" && var.manage_kms_iam ? 1 : 0
+  provider = google-beta
+  project  = var.ml_ops_project_id
+  service  = "pubsub.googleapis.com"
+}
+
+resource "google_kms_crypto_key_iam_member" "pubsub_cmek" {
+  count = local.effective_kms_key_id != "" && var.manage_kms_iam ? 1 : 0
+
+  crypto_key_id = local.effective_kms_key_id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = google_project_service_identity.pubsub_agent[0].member
+}
+
 resource "google_pubsub_topic" "alerts" {
   project      = var.ml_ops_project_id
   name         = local.alert_topic_name
@@ -19,6 +34,8 @@ resource "google_pubsub_topic" "alerts" {
   message_storage_policy {
     allowed_persistence_regions = [var.region]
   }
+
+  depends_on = [google_kms_crypto_key_iam_member.pubsub_cmek]
 }
 
 resource "google_service_account" "workflow" {
@@ -105,16 +122,17 @@ resource "google_workflows_workflow" "bqml_xai" {
   source_contents     = local.workflow_source
 
   user_env_vars = {
-    ML_OPS_PROJECT_ID          = var.ml_ops_project_id
-    CORE_PROJECT_ID            = var.core_project_id
-    SILVER_DATASET_ID          = var.silver_dataset_id
-    FEATURE_GROUP_SOURCE_TABLE = var.feature_group_source_table
-    ML_AUDIT_DATASET_ID        = var.ml_audit_dataset_id
-    ML_AUDIT_TABLE_ID          = var.ml_audit_table_id
-    BQ_LOCATION                = var.region
-    MODEL_ID                   = "${replace(lower(var.prefix), "-", "_")}_credit_bqml_v1"
-    REASON_RULE_VERSION        = "bnm-fair-lending-v1.0"
-    ALERT_TOPIC_PATH           = google_pubsub_topic.alerts.id
+    ML_OPS_PROJECT_ID           = var.ml_ops_project_id
+    CORE_PROJECT_ID             = var.core_project_id
+    SILVER_DATASET_ID           = var.silver_dataset_id
+    FEATURE_GROUP_SOURCE_TABLE  = var.feature_group_source_table
+    ML_AUDIT_DATASET_ID         = var.ml_audit_dataset_id
+    ML_AUDIT_TABLE_ID           = var.ml_audit_table_id
+    ML_TRAINING_LABELS_TABLE_ID = var.ml_training_labels_table_id
+    BQ_LOCATION                 = var.region
+    MODEL_ID                    = "${replace(lower(var.prefix), "-", "_")}_credit_bqml_v1"
+    REASON_RULE_VERSION         = "bnm-fair-lending-v1.0"
+    ALERT_TOPIC_PATH            = google_pubsub_topic.alerts.id
   }
 
   depends_on = [

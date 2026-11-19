@@ -18,6 +18,11 @@ output "vertex_endpoint_id" {
   description = "Sandbox Vertex AI Endpoint resource ID when online track is active."
 }
 
+output "psc_endpoint_ip" {
+  value       = try(module.xai_serving_endpoint[0].psc_endpoint_ip, "")
+  description = "Sandbox Private Service Connect endpoint IP when online track is active."
+}
+
 output "scorer_service_uri" {
   value       = try(module.xai_serving_endpoint[0].scorer_service_uri, "")
   description = "Sandbox Cloud Run XAI scorer URI when enabled."

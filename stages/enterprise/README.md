@@ -10,4 +10,4 @@ Multi-project Terraform root coordinating Feature Store, Vertex AI Endpoint, Clo
 
 ## Inputs and Outputs
 
-See [variables.tf](variables.tf) and [outputs.tf](outputs.tf) for the 32-variable interface contract.
+See [variables.tf](variables.tf) and [outputs.tf](outputs.tf) for the 35-variable interface contract.

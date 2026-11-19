@@ -36,7 +36,7 @@ Load `.agents/skills/setup-data-science/SKILL.md` before deploying this reposito
 
 1. Every directory under `modules/ds/*` must contain only `README.md`, `main.tf`, `variables.tf`, `outputs.tf`, and `versions.tf`.
 2. Every stage under `stages/*` must contain only those five files plus `terraform.tfvars.example` and `.terraform.lock.hcl`.
-3. `stages/enterprise` also maintains `envs/{dev,staging,prod}.tfvars.example` and exactly `32` declared variables.
+3. `stages/enterprise` also maintains `envs/{dev,staging,prod}.tfvars.example` and exactly `35` declared variables.
 4. Every `versions.tf` must pin `required_version = ">= 1.8.0"` and `hashicorp/google` `version = ">= 8.0.0, < 9.0.0"`.
 5. Never use deprecated `explanation_spec`, `google_notebooks_instance`, or `optimized` Feature Online Store blocks.
 6. Never write `coalesce(..., "")` or `var.x != null && trimspace(var.x) != ""` in Terraform.

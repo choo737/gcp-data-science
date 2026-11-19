@@ -99,6 +99,9 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
         deploy_text = (workflows_dir / "terraform-deploy.yml").read_text(encoding="utf-8")
         self.assertIn("model-validator-gate:", deploy_text)
         self.assertIn("environment: model-validator", deploy_text)
+        self.assertIn("ALLOW_INFRA_ONLY_PROD_APPLY", deploy_text)
+        self.assertIn("MRM_EVAL_INPUT_JSON is missing or unreadable; prod apply blocked (fail-closed).", deploy_text)
+        self.assertIn("gcloud run jobs execute", deploy_text)
         self.assertIn("GCP_DS_WIF_SA || vars.GCP_WIF_SERVICE_ACCOUNT", deploy_text)
         self.assertIn("data-science/data-science-outputs.json", deploy_text)
         self.assertIn('data-science/${DOMAIN_NAME}/data-science-outputs.json', deploy_text)
@@ -107,15 +110,23 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
     def test_bqml_workflow_yaml_and_sql_contracts(self) -> None:
         wf_text = (REPO_ROOT / "workflows" / "bqml_xai_pipeline.workflows.yaml").read_text(encoding="utf-8")
         self.assertNotIn("v1beta1", wf_text)
+        for forbidden_param in ("@model_fqn", "@feature_fqn", "@ledger_fqn", "predicted_approved_flag_probs"):
+            self.assertNotIn(forbidden_param, wf_text)
         for required in (
             "main:",
             "params: [input]",
+            "text.match_regex",
+            "googleapis.bigquery.v2.jobs.insert",
+            "googleapis.bigquery.v2.jobs.get",
             "BOOSTED_TREE_CLASSIFIER",
             "enable_global_explain = TRUE",
             "model_registry = 'VERTEX_AI'",
+            "ML.ENTITY_FEATURES_AT_TIME",
             "ML.FEATURES_AT_TIME",
             "ML.EXPLAIN_PREDICT",
             "FALSE AS approx_feature_contrib",
+            "prediction_value",
+            "JSON_OBJECT",
             "max_polls: 120",
             'parameterMode: "NAMED"',
             "useLegacySql: false",
@@ -137,10 +148,105 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
         sql_text = (REPO_ROOT / "sql" / "track_a_bqml_xai.sql").read_text(encoding="utf-8")
         for col in LOCKED_LEDGER_COLUMNS:
             self.assertIn(col, sql_text)
+        for feature_col in (
+            "tenure_months",
+            "avg_monthly_spend",
+            "rolling_order_count",
+            "days_since_last_order",
+            "cancellation_rate_30d",
+            "discount_utilization_ratio",
+        ):
+            self.assertIn(feature_col, sql_text)
+            self.assertIn(feature_col, wf_text)
+        self.assertIn("ML.ENTITY_FEATURES_AT_TIME", sql_text)
         self.assertIn("APPROX_FEATURE_CONTRIB", sql_text.upper())
+        self.assertNotIn("predicted_approved_flag_probs", sql_text)
+        self.assertNotIn("customer_id", sql_text)
+
+    def test_kfp_components_ast_zero_closures_and_packages_to_install(self) -> None:
+        import builtins
 
         kfp_path = REPO_ROOT / "src" / "pipelines" / "credit_scoring_kfp.py"
-        ast.parse(kfp_path.read_text(encoding="utf-8"), filename=str(kfp_path))
+        source = kfp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(kfp_path))
+
+        builtin_names = set(dir(builtins))
+
+        def _collect_target_names(node: ast.AST, out: set[str]) -> None:
+            if isinstance(node, ast.Name):
+                out.add(node.id)
+            elif isinstance(node, (ast.Tuple, ast.List)):
+                for elt in node.elts:
+                    _collect_target_names(elt, out)
+            elif isinstance(node, ast.Starred):
+                _collect_target_names(node.value, out)
+
+        component_funcs: list[ast.FunctionDef] = []
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for dec in node.decorator_list:
+                if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute) and dec.func.attr == "component":
+                    component_funcs.append(node)
+                    pkg_kw = [kw for kw in dec.keywords if kw.arg == "packages_to_install"]
+                    self.assertEqual(len(pkg_kw), 1, f"{node.name} missing packages_to_install")
+                    self.assertIsInstance(pkg_kw[0].value, ast.List)
+                    self.assertGreater(len(pkg_kw[0].value.elts), 0, f"{node.name} has empty packages_to_install")
+
+        self.assertEqual(
+            {fn.name for fn in component_funcs},
+            {"extract_pit_features", "train_xgboost_challenger", "evaluate_mrm_gate", "register_cpr_model"},
+        )
+
+        for fn in component_funcs:
+            bound: set[str] = {arg.arg for arg in fn.args.args + fn.args.kwonlyargs}
+            if fn.args.vararg:
+                bound.add(fn.args.vararg.arg)
+            if fn.args.kwarg:
+                bound.add(fn.args.kwarg.arg)
+            comp_vars: set[str] = set()
+            loaded: set[str] = set()
+
+            for stmt in fn.body:
+                for sub in ast.walk(stmt):
+                    if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                        for alias in sub.names:
+                            bound.add(alias.asname or alias.name.split(".")[0])
+                    elif isinstance(sub, ast.Assign):
+                        for tgt in sub.targets:
+                            _collect_target_names(tgt, bound)
+                    elif isinstance(sub, ast.AnnAssign):
+                        _collect_target_names(sub.target, bound)
+                    elif isinstance(sub, ast.AugAssign):
+                        _collect_target_names(sub.target, bound)
+                    elif isinstance(sub, ast.For):
+                        _collect_target_names(sub.target, bound)
+                    elif isinstance(sub, ast.With):
+                        for item in sub.items:
+                            if item.optional_vars is not None:
+                                _collect_target_names(item.optional_vars, bound)
+                    elif isinstance(sub, ast.ExceptHandler) and sub.name:
+                        bound.add(sub.name)
+                    elif isinstance(sub, ast.comprehension):
+                        _collect_target_names(sub.target, comp_vars)
+                    elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                        loaded.add(sub.id)
+
+            unbound = loaded - bound - comp_vars - builtin_names
+            self.assertEqual(unbound, set(), f"Component {fn.name} references unbound outer symbols: {sorted(unbound)}")
+
+        try:
+            from kfp import compiler  # type: ignore
+            from src.pipelines.credit_scoring_kfp import credit_scoring_xai_pipeline
+        except ImportError:
+            return
+
+        with tempfile.TemporaryDirectory() as td:
+            pkg_path = Path(td) / "credit_scoring_xai_pipeline.yaml"
+            compiler.Compiler().compile(pipeline_func=credit_scoring_xai_pipeline, package_path=str(pkg_path))
+            compiled = pkg_path.read_text(encoding="utf-8")
+            self.assertIn("evaluate-mrm-gate", compiled)
+            self.assertIn("register-cpr-model", compiled)
 
     def test_enterprise_and_sandbox_ledger_schemas_contain_18_columns(self) -> None:
         for stage in ("enterprise", "sandbox"):
@@ -148,6 +254,11 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
             with self.subTest(stage=stage):
                 for col in LOCKED_LEDGER_COLUMNS:
                     self.assertIn(f'name = "{col}"', tf_text)
+                for label_col in ("application_id", "entity_id", "label_timestamp", "approved_flag", "demographic_group"):
+                    self.assertIn(f'name = "{label_col}"', tf_text)
+                self.assertIn("require_partition_filter = true", tf_text)
+        ent_text = (REPO_ROOT / "stages" / "enterprise" / "main.tf").read_text(encoding="utf-8")
+        self.assertIn("count = var.create_ml_audit_ledger_table ? 1 : 0", ent_text)
 
     def test_feature_store_blocks_jakarta_online_serving(self) -> None:
         fs_tf = (REPO_ROOT / "modules" / "ds" / "feature-store" / "main.tf").read_text(encoding="utf-8")
@@ -242,6 +353,68 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
             )
             self.assertEqual(exp_res.returncode, 0, exp_res.stderr)
             self.assertTrue((gcs_store / "state-bkt__shared__org.json").is_file())
+
+            # Verify backend prefix resolution for external git repos vs internal stages.
+            tf_log = tmp_path / "tf_invocations.log"
+            tf_shim.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                f"log_path = {str(tf_log)!r}\n"
+                "with open(log_path, 'a', encoding='utf-8') as f:\n"
+                "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+                "if 'output' in sys.argv:\n"
+                "    print(json.dumps({'core_storage_project_id': {'value': 'proj-core-02'}}))\n",
+                encoding="utf-8",
+            )
+            tf_shim.chmod(0o755)
+
+            ext_repo = tmp_path / "gcp-foundation"
+            (ext_repo / ".git").mkdir(parents=True)
+            ext_stage = ext_repo / "data" / "enterprise" / "03-data-science"
+            (ext_stage / "envs").mkdir(parents=True)
+
+            ext_res = subprocess.run(
+                [
+                    str(script_path),
+                    "--env",
+                    "staging",
+                    "--tfstate-bucket",
+                    "state-bkt",
+                    "--from-local",
+                    str(ext_stage),
+                    str(dst),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(ext_res.returncode, 0, ext_res.stderr)
+
+            int_stage_envs = REPO_ROOT / "stages" / "enterprise"
+            int_res = subprocess.run(
+                [
+                    str(script_path),
+                    "--env",
+                    "staging",
+                    "--tfstate-bucket",
+                    "state-bkt",
+                    str(int_stage_envs),
+                    str(dst),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(int_res.returncode, 0, int_res.stderr)
+
+            log_lines = tf_log.read_text(encoding="utf-8").splitlines()
+            init_lines = [line for line in log_lines if " init " in line]
+            self.assertTrue(any("-backend-config=prefix=data/enterprise/03-data-science/staging" in l for l in init_lines), init_lines)
+            self.assertFalse(any("data-science/data/enterprise/03-data-science" in l for l in init_lines), init_lines)
+            self.assertFalse(any(".." in l for l in init_lines), init_lines)
+            self.assertTrue(any("-backend-config=prefix=data-science/enterprise/staging" in l for l in init_lines), init_lines)
 
 
 if __name__ == "__main__":

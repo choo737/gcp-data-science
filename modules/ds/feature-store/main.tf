@@ -27,7 +27,7 @@ resource "google_vertex_ai_feature_group" "customer_features" {
   labels      = var.labels
 
   big_query {
-    entity_id_columns = ["customer_id"]
+    entity_id_columns = var.entity_id_columns
     big_query_source {
       input_uri = local.feature_source_uri
     }

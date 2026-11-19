@@ -47,6 +47,9 @@ LOCKED_ENTERPRISE_VARIABLES = frozenset({
     "bqml_schedule_cron",
     "core_project_id",
     "cpr_container_image",
+    "cpr_model_artifact_uri",
+    "cpr_model_sha256",
+    "create_ml_audit_ledger_table",
     "deploy_cpr_model",
     "domain_name",
     "ds_exp_project_id",
@@ -174,10 +177,10 @@ class RepoSymmetryTest(unittest.TestCase):
                     prod_cfg = (envs_dir / "prod.tfvars.example").read_text(encoding="utf-8")
                     self.assertIn("@sha256:", prod_cfg)
 
-    def test_enterprise_variables_match_locked_32_contract(self) -> None:
+    def test_enterprise_variables_match_locked_35_contract(self) -> None:
         vars_path = REPO_ROOT / "stages" / "enterprise" / "variables.tf"
         var_names = re.findall(r'^\s*variable\s+"([A-Za-z0-9_]+)"\s*\{', vars_path.read_text(encoding="utf-8"), re.MULTILINE)
-        self.assertEqual(len(var_names), 32)
+        self.assertEqual(len(var_names), 35)
         self.assertEqual(set(var_names), LOCKED_ENTERPRISE_VARIABLES)
 
     def test_versions_tf_pins_providers_and_stage_gcs_backend(self) -> None:

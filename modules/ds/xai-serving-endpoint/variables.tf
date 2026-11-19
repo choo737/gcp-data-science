@@ -67,6 +67,49 @@ variable "cpr_container_image" {
   description = "Container image URI (pinned to @sha256 in prod) for the CPR TreeSHAP predictor."
 }
 
+variable "cpr_model_artifact_uri" {
+  type        = string
+  default     = ""
+  description = "GCS directory or artifact URI hosting the trained XGBoost model.ubj when deploy_cpr_model is true."
+}
+
+variable "cpr_model_sha256" {
+  type        = string
+  default     = ""
+  description = "Expected lowercase hex SHA-256 digest of the CPR XGBoost model artifact."
+}
+
+variable "cpr_deployer_image" {
+  type        = string
+  default     = ""
+  description = "Optional container image URI for the Cloud Run v2 CPR deployment job."
+}
+
+variable "feature_names" {
+  type = list(string)
+  default = [
+    "tenure_months",
+    "avg_monthly_spend",
+    "rolling_order_count",
+    "days_since_last_order",
+    "cancellation_rate_30d",
+    "discount_utilization_ratio",
+  ]
+  description = "Ordered feature list configured on the deployed CPR predictor container."
+}
+
+variable "psc_service_attachment" {
+  type        = string
+  default     = ""
+  description = "Optional Private Service Connect service attachment URI for manual consumer forwarding rules."
+}
+
+variable "psc_endpoint_ip_override" {
+  type        = string
+  default     = ""
+  description = "Optional explicit Private Service Connect endpoint IP or private prediction host."
+}
+
 variable "serving_track" {
   type        = string
   default     = "both"

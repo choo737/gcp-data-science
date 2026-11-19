@@ -18,8 +18,18 @@ output "feature_view_id" {
   description = "Vertex AI FeatureView resource ID when online serving is enabled."
 }
 
+output "ml_ops_project_id" {
+  value       = var.ml_ops_project_id
+  description = "GCP project ID hosting ML Ops resources."
+}
+
+output "region" {
+  value       = var.region
+  description = "Active deployment region."
+}
+
 output "ml_xai_audit_ledger_id" {
-  value       = google_bigquery_table.ml_xai_audit_ledger.id
+  value       = try(google_bigquery_table.ml_xai_audit_ledger[0].id, "projects/${var.ml_ops_project_id}/datasets/${var.ml_audit_dataset_id}/tables/${var.ml_audit_table_id}")
   description = "Qualified BigQuery resource ID for ml_xai_audit_ledger."
 }
 
@@ -31,6 +41,16 @@ output "vertex_endpoint_id" {
 output "vertex_endpoint_name" {
   value       = try(module.xai_serving_endpoint[0].vertex_endpoint_name, "")
   description = "Numeric Vertex AI Endpoint ID when online serving track is active."
+}
+
+output "psc_endpoint_ip" {
+  value       = try(module.xai_serving_endpoint[0].psc_endpoint_ip, "")
+  description = "Private Service Connect endpoint IP when online serving track is active."
+}
+
+output "cpr_deployer_job_name" {
+  value       = try(module.xai_serving_endpoint[0].cpr_deployer_job_name, "")
+  description = "Cloud Run v2 job name that uploads and deploys the CPR model when enabled."
 }
 
 output "scorer_service_uri" {

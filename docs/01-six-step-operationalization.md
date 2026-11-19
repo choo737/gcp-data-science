@@ -32,7 +32,8 @@ For Brownfield estates, generate `stages/enterprise/00_linked.auto.tfvars.json` 
 
 1. Copy `stages/enterprise/envs/dev.tfvars.example` to `stages/enterprise/envs/dev.tfvars`.
 2. Deploy Track A (`ds_serving_track = "bqml_batch"`, `enable_bqml_schedule = false`) first in `dev`.
-3. Promote `staging` with `ds_serving_track = "both"` and `enable_online_feature_store = true` in `asia-southeast1`.
+3. Promote `staging` with `ds_serving_track = "both"` and `enable_online_feature_store = false` to avoid idle Bigtable cost.
+4. Opt into `enable_online_feature_store = true` in `asia-southeast1` only when `<25 ms` online serving is required.
 
 ## Day 2: Step 5 — Execute Mathematical MRM Gate Before `prod`
 

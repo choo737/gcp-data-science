@@ -110,6 +110,18 @@ variable "cpr_container_image" {
   description = "Container image URI for the CPR TreeSHAP predictor."
 }
 
+variable "cpr_model_artifact_uri" {
+  type        = string
+  default     = ""
+  description = "GCS directory or artifact URI hosting the trained XGBoost model.ubj when deploy_cpr_model is true."
+}
+
+variable "cpr_model_sha256" {
+  type        = string
+  default     = ""
+  description = "Expected lowercase hex SHA-256 digest of the CPR XGBoost model artifact."
+}
+
 variable "enable_bqml_schedule" {
   type        = bool
   default     = false
@@ -132,6 +144,12 @@ variable "kms_key_id" {
   type        = string
   default     = ""
   description = "Optional regional Cloud KMS CryptoKey ID for CMEK."
+}
+
+variable "manage_kms_iam" {
+  type        = bool
+  default     = true
+  description = "Grant KMS CryptoKey encrypter/decrypter IAM bindings for service identities and SAs."
 }
 
 variable "vpc_id" {

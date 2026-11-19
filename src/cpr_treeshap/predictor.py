@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import tempfile
 from typing import Any, Callable, Mapping, Sequence
 
 # Lock OpenMP thread count to 1 for deterministic TreeSHAP floating-point reduction.
@@ -23,6 +24,30 @@ REASON_RULE_VERSION = "bnm-fair-lending-v1.0"
 SCHEMA_VERSION = "v1"
 
 DEFAULT_ADVERSE_REASON_CODES: dict[str, tuple[str, str]] = {
+    "tenure_months": (
+        "RC01",
+        "Short customer relationship tenure relative to underwriting policy",
+    ),
+    "avg_monthly_spend": (
+        "RC02",
+        "Insufficient rolling 30-day net transaction volume",
+    ),
+    "rolling_order_count": (
+        "RC03",
+        "Low verified order frequency in trailing 30-day window",
+    ),
+    "days_since_last_order": (
+        "RC04",
+        "Extended account inactivity since last completed transaction",
+    ),
+    "cancellation_rate_30d": (
+        "RC05",
+        "Elevated 30-day order cancellation or reversal rate",
+    ),
+    "discount_utilization_ratio": (
+        "RC06",
+        "High promotional discount dependency relative to gross spend",
+    ),
     "delinquency_count_12m": (
         "RC_DELINQ_12M",
         "Recent delinquency events in the past twelve months.",
@@ -34,14 +59,6 @@ DEFAULT_ADVERSE_REASON_CODES: dict[str, tuple[str, str]] = {
     "debt_to_income_ratio": (
         "RC_HIGH_DTI",
         "Elevated debt-to-income obligation ratio.",
-    ),
-    "tenure_months": (
-        "RC_SHORT_TENURE",
-        "Insufficient account or relationship tenure length.",
-    ),
-    "avg_monthly_spend": (
-        "RC_LOW_SPEND_ACTIVITY",
-        "Low observed monthly account transaction activity.",
     ),
     "verified_income_band": (
         "RC_INCOME_BAND",
@@ -64,6 +81,31 @@ def compute_sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def parse_feature_names(raw_features: str) -> list[str]:
+    """Parse FEATURE_NAMES from either a JSON list or comma-separated string."""
+    stripped = raw_features.strip()
+    if not stripped:
+        return []
+    if stripped.startswith("["):
+        parsed = json.loads(stripped)
+        if not isinstance(parsed, list):
+            raise ValueError("FEATURE_NAMES JSON must be a list of strings.")
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return [part.strip() for part in stripped.split(",") if part.strip()]
+
+
+def _parse_gcs_uri(gs_uri: str) -> tuple[str, str]:
+    if not gs_uri.startswith("gs://"):
+        raise ValueError(f"Expected gs:// URI, got: {gs_uri}")
+    rest = gs_uri[len("gs://"):]
+    if "/" not in rest:
+        raise ValueError(f"GCS URI must include bucket and object path: {gs_uri}")
+    bucket_name, blob_name = rest.split("/", 1)
+    if not bucket_name or not blob_name:
+        raise ValueError(f"Invalid GCS URI: {gs_uri}")
+    return bucket_name, blob_name
 
 
 def rank_adverse_features(
@@ -151,31 +193,56 @@ class TreeShapCprPredictor:
         additivity_tolerance: float = 1e-5,
         explained_class: str = "APPROVE",
         top_k_reasons: int = 4,
+        reason_rule_version: str = REASON_RULE_VERSION,
+        storage_client: Any | None = None,
     ) -> "TreeShapCprPredictor":
-        """Verify SHA-256 manifest digest and load an XGBoost Booster artifact."""
-        artifact = Path(model_path)
-        if not artifact.is_file():
-            raise FileNotFoundError(f"Model artifact not found: {artifact}")
-        actual_sha256 = compute_sha256_file(artifact)
-        if not hmac.compare_digest(actual_sha256.lower(), expected_sha256.strip().lower()):
-            raise ValueError(
-                f"Model artifact SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256}"
-            )
-        import xgboost as xgb  # type: ignore
+        """Verify SHA-256 manifest digest (for local or gs:// URIs) and load XGBoost Booster."""
+        raw_path = str(model_path).strip()
+        temp_path: Path | None = None
+        try:
+            if raw_path.startswith("gs://"):
+                bucket_name, blob_name = _parse_gcs_uri(raw_path)
+                if storage_client is None:
+                    from google.cloud import storage  # type: ignore
 
-        booster = xgb.Booster()
-        booster.load_model(str(artifact))
-        return cls(
-            booster=booster,
-            feature_names=feature_names,
-            model_id=model_id,
-            model_version_id=model_version_id,
-            model_artifact_sha256=actual_sha256,
-            container_image_digest=container_image_digest,
-            additivity_tolerance=additivity_tolerance,
-            explained_class=explained_class,
-            top_k_reasons=top_k_reasons,
-        )
+                    storage_client = storage.Client()
+                fd, tmp_name = tempfile.mkstemp(prefix="cpr-model-", suffix=".ubj")
+                os.close(fd)
+                temp_path = Path(tmp_name)
+                os.chmod(temp_path, 0o600)
+                bucket = storage_client.bucket(bucket_name)
+                blob = bucket.blob(blob_name)
+                blob.download_to_filename(str(temp_path))
+                artifact = temp_path
+            else:
+                artifact = Path(model_path)
+                if not artifact.is_file():
+                    raise FileNotFoundError(f"Model artifact not found: {artifact}")
+
+            actual_sha256 = compute_sha256_file(artifact)
+            if not hmac.compare_digest(actual_sha256.lower(), expected_sha256.strip().lower()):
+                raise ValueError(
+                    f"Model artifact SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256}"
+                )
+            import xgboost as xgb  # type: ignore
+
+            booster = xgb.Booster()
+            booster.load_model(str(artifact))
+            return cls(
+                booster=booster,
+                feature_names=feature_names,
+                model_id=model_id,
+                model_version_id=model_version_id,
+                model_artifact_sha256=actual_sha256,
+                container_image_digest=container_image_digest,
+                additivity_tolerance=additivity_tolerance,
+                explained_class=explained_class,
+                top_k_reasons=top_k_reasons,
+                reason_rule_version=reason_rule_version,
+            )
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink()
 
     def _build_dmatrix(self, row_values: list[float]) -> Any:
         if self._dmatrix_factory is not None:
@@ -306,6 +373,15 @@ def create_cpr_wsgi_app(predictor: TreeShapCprPredictor) -> Callable[..., list[b
     return application
 
 
+def resolve_model_source_from_env() -> str:
+    """Resolve model artifact URI from AIP_STORAGE_URI or MODEL_PATH."""
+    aip_storage_uri = os.environ.get("AIP_STORAGE_URI", "").strip()
+    model_filename = os.environ.get("MODEL_FILENAME", "model.ubj").strip() or "model.ubj"
+    if aip_storage_uri:
+        return f"{aip_storage_uri.rstrip('/')}/{model_filename}"
+    return os.environ.get("MODEL_PATH", "").strip()
+
+
 _LAZY_CPR_APP: Callable[..., list[bytes]] | None = None
 
 
@@ -313,20 +389,20 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
     """Lazy Gunicorn WSGI entrypoint loading a SHA-256 verified XGBoost artifact."""
     global _LAZY_CPR_APP
     if _LAZY_CPR_APP is None:
-        model_path = os.environ.get("MODEL_PATH", "").strip()
+        model_source = resolve_model_source_from_env()
         expected_sha = os.environ.get("EXPECTED_MODEL_SHA256", "").strip()
-        raw_features = os.environ.get("FEATURE_NAMES", "").strip()
-        feature_names = [f.strip() for f in raw_features.split(",") if f.strip()]
-        if not model_path or not expected_sha or not feature_names:
-            raise RuntimeError("MODEL_PATH, EXPECTED_MODEL_SHA256, and FEATURE_NAMES are required.")
+        feature_names = parse_feature_names(os.environ.get("FEATURE_NAMES", ""))
+        if not model_source or not expected_sha or not feature_names:
+            raise RuntimeError("AIP_STORAGE_URI or MODEL_PATH, EXPECTED_MODEL_SHA256, and FEATURE_NAMES are required.")
         predictor = TreeShapCprPredictor.load_from_file(
-            model_path=model_path,
+            model_path=model_source,
             expected_sha256=expected_sha,
             feature_names=feature_names,
             model_id=os.environ.get("MODEL_ID", "credit_xgb_cpr"),
             model_version_id=os.environ.get("MODEL_VERSION_ID", "1"),
             container_image_digest=os.environ.get("CONTAINER_IMAGE_DIGEST", "unpinned"),
             additivity_tolerance=float(os.environ.get("SHAP_ADDITIVITY_TOLERANCE", "0.00001")),
+            reason_rule_version=os.environ.get("REASON_RULE_VERSION", REASON_RULE_VERSION),
         )
         _LAZY_CPR_APP = create_cpr_wsgi_app(predictor)
     return _LAZY_CPR_APP(environ, start_response)

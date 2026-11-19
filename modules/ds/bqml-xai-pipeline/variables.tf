@@ -30,6 +30,12 @@ variable "ml_audit_table_id" {
   description = "BigQuery table ID for immutable XAI audit records."
 }
 
+variable "ml_training_labels_table_id" {
+  type        = string
+  default     = "ml_training_labels"
+  description = "BigQuery table ID storing point-in-time ground-truth training labels."
+}
+
 variable "region" {
   type        = string
   default     = "asia-southeast1"
