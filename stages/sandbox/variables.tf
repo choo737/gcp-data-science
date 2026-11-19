@@ -47,8 +47,8 @@ variable "ml_audit_table_id" {
 
 variable "feature_group_source_table" {
   type        = string
-  default     = "ml_customer_features"
-  description = "BigQuery Silver table backing the Vertex AI Feature Group."
+  default     = "vw_ml_customer_features_online"
+  description = "BigQuery Silver view or table backing the Vertex AI Feature Group."
 }
 
 variable "ds_serving_track" {

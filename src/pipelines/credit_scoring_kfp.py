@@ -235,14 +235,18 @@ def evaluate_mrm_gate(
             avg_acc = sum(y_true[i] for i in members) / len(members)
             ece += (len(members) / total_n) * abs(avg_acc - avg_conf)
 
-    # 80% disparate impact across demographic_group
+    # 80% disparate impact across demographic_group (require >= 2 distinct non-empty subgroups)
     preds = [1 if p >= 0.5 else 0 for p in probs]
-    groups = [str(g) for g in df["demographic_group"].fillna("UNKNOWN").tolist()]
+    raw_groups = df["demographic_group"].tolist()
+    groups = [str(g).strip() if g is not None and pd.notna(g) else "" for g in raw_groups]
+    valid_pairs = [(pred, grp) for pred, grp in zip(preds, groups) if grp]
     grp_totals: dict[str, int] = {}
     grp_pos: dict[str, int] = {}
-    for pred, grp in zip(preds, groups):
+    for pred, grp in valid_pairs:
         grp_totals[grp] = grp_totals.get(grp, 0) + 1
         grp_pos[grp] = grp_pos.get(grp, 0) + pred
+    if len(grp_totals) < 2:
+        raise RuntimeError("MRM fairness gate requires at least 2 demographic subgroups in holdout data.")
     pos_rates = {g: grp_pos[g] / grp_totals[g] for g in grp_totals if grp_totals[g] > 0}
     max_rate = max(pos_rates.values()) if pos_rates else 0.0
     min_rate = min(pos_rates.values()) if pos_rates else 0.0
@@ -318,6 +322,7 @@ def register_cpr_model(
     artifact_sha256: str,
     mrm_approved: bool,
     reason_rule_version: str = "bnm-fair-lending-v1.0",
+    shap_tolerance: float = 1e-5,
     vertex_endpoint_id: str = "",
     deploy_to_endpoint: bool = False,
 ) -> str:
@@ -340,6 +345,9 @@ def register_cpr_model(
             "EXPECTED_MODEL_SHA256": artifact_sha256,
             "FEATURE_NAMES": json.dumps(list(feature_columns)),
             "REASON_RULE_VERSION": reason_rule_version,
+            "CONTAINER_IMAGE_DIGEST": cpr_serving_image,
+            "MODEL_ID": model_display_name,
+            "SHAP_ADDITIVITY_TOLERANCE": str(shap_tolerance),
         },
     )
     if deploy_to_endpoint and vertex_endpoint_id:
@@ -364,10 +372,10 @@ def register_cpr_model(
 def credit_scoring_xai_pipeline(
     core_project_id: str,
     silver_dataset_id: str,
-    feature_table: str,
     ml_ops_project_id: str,
     ml_audit_dataset_id: str,
     cpr_serving_image: str,
+    feature_table: str = "vw_ml_customer_features_online",
     region: str = "asia-southeast1",
     labels_table: str = "ml_training_labels",
     feature_columns: List[str] = DEFAULT_FEATURE_COLUMNS,
@@ -416,6 +424,7 @@ def credit_scoring_xai_pipeline(
             artifact_sha256=train_task.outputs["Output"],
             mrm_approved=gate_task.outputs["approved"],
             reason_rule_version=reason_rule_version,
+            shap_tolerance=shap_tolerance,
             vertex_endpoint_id=vertex_endpoint_id,
             deploy_to_endpoint=deploy_to_endpoint,
         )
@@ -425,7 +434,69 @@ def build_credit_scoring_pipeline(
     pipeline_name: str = "credit-scoring-xai-pipeline",
     feature_columns: Sequence[str] = tuple(DEFAULT_FEATURE_COLUMNS),
 ) -> Any:
-    """Return the compiled KFP v2 pipeline definition."""
-    _ = pipeline_name
-    _ = feature_columns
-    return credit_scoring_xai_pipeline
+    """Return a KFP v2 pipeline definition configured with the requested name and feature list."""
+    default_features = list(feature_columns)
+    if pipeline_name == "credit-scoring-xai-pipeline" and default_features == DEFAULT_FEATURE_COLUMNS:
+        return credit_scoring_xai_pipeline
+
+    @dsl.pipeline(name=pipeline_name)
+    def custom_credit_scoring_pipeline(
+        core_project_id: str,
+        silver_dataset_id: str,
+        ml_ops_project_id: str,
+        ml_audit_dataset_id: str,
+        cpr_serving_image: str,
+        feature_table: str = "vw_ml_customer_features_online",
+        region: str = "asia-southeast1",
+        labels_table: str = "ml_training_labels",
+        feature_columns: List[str] = default_features,
+        min_auc: float = 0.75,
+        min_disparate_impact: float = 0.80,
+        max_brier: float = 0.25,
+        max_ece: float = 0.10,
+        shap_tolerance: float = 1e-5,
+        reason_rule_version: str = "bnm-fair-lending-v1.0",
+        vertex_endpoint_id: str = "",
+        deploy_to_endpoint: bool = False,
+    ) -> None:
+        feat_task = extract_pit_features(
+            core_project_id=core_project_id,
+            silver_dataset_id=silver_dataset_id,
+            feature_table=feature_table,
+            ml_ops_project_id=ml_ops_project_id,
+            ml_audit_dataset_id=ml_audit_dataset_id,
+            labels_table=labels_table,
+            feature_columns=feature_columns,
+        )
+        train_task = train_xgboost_challenger(
+            dataset=feat_task.outputs["output_dataset"],
+            feature_columns=feature_columns,
+        )
+        gate_task = evaluate_mrm_gate(
+            eval_dataset=train_task.outputs["eval_dataset"],
+            model_artifact=train_task.outputs["model_artifact"],
+            feature_columns=feature_columns,
+            expected_sha256=train_task.outputs["Output"],
+            min_auc=min_auc,
+            min_disparate_impact=min_disparate_impact,
+            max_brier=max_brier,
+            max_ece=max_ece,
+            shap_tolerance=shap_tolerance,
+        )
+        with dsl.If(gate_task.outputs["approved"] == True):  # noqa: E712
+            register_cpr_model(
+                ml_ops_project_id=ml_ops_project_id,
+                region=region,
+                model_display_name="credit-scoring-cpr-treeshap",
+                cpr_serving_image=cpr_serving_image,
+                model_artifact=train_task.outputs["model_artifact"],
+                feature_columns=feature_columns,
+                artifact_sha256=train_task.outputs["Output"],
+                mrm_approved=gate_task.outputs["approved"],
+                reason_rule_version=reason_rule_version,
+                shap_tolerance=shap_tolerance,
+                vertex_endpoint_id=vertex_endpoint_id,
+                deploy_to_endpoint=deploy_to_endpoint,
+            )
+
+    return custom_credit_scoring_pipeline

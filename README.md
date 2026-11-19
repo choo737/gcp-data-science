@@ -41,7 +41,7 @@ One enterprise stage coordinates batch BQML explainability, private online CPR T
 
 ```mermaid
 flowchart LR
-  SILVER["BigQuery Silver<br/>ml_customer_features"] --> FG["Vertex AI Feature Group<br/>+ Optional Bigtable Store"]
+  SILVER["BigQuery Silver<br/>vw_ml_customer_features_online"] --> FG["Vertex AI Feature Group<br/>+ Optional Bigtable Store"]
   SILVER --> TRACKA["Track A: BQML Workflow<br/>ML.EXPLAIN_PREDICT (Exact)"]
   FG --> TRACKB["Track B: Vertex :predict<br/>CPR XGBoost TreeSHAP"]
   TRACKB --> SCORER["Cloud Run XAI Scorer<br/>Fail-Closed Additivity Gate"]

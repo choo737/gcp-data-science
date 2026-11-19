@@ -148,6 +148,14 @@ jobs:
             deploy_region="$(terraform -chdir=stages/enterprise output -raw region)"
             ml_ops_project="$(terraform -chdir=stages/enterprise output -raw ml_ops_project_id)"
             gcloud run jobs execute "${cpr_job_name}" --region "${deploy_region}" --project "${ml_ops_project}" --wait
+            endpoint_id="$(terraform -chdir=stages/enterprise output -raw vertex_endpoint_name 2>/dev/null || true)"
+            scorer_service_name="$(terraform -chdir=stages/enterprise output -raw scorer_service_name 2>/dev/null || true)"
+            if [ -n "${endpoint_id}" ] && [ -n "${scorer_service_name}" ]; then
+              live_psc_ip="$(gcloud ai endpoints describe "${endpoint_id}" --region="${deploy_region}" --project="${ml_ops_project}" --format='value(privateServiceConnectConfig.pscAutomationConfigs[0].ipAddress)' || true)"
+              if [ -n "${live_psc_ip}" ]; then
+                gcloud run services update "${scorer_service_name}" --region="${deploy_region}" --project="${ml_ops_project}" --update-env-vars="VERTEX_PSC_ENDPOINT_IP=${live_psc_ip}" --quiet
+              fi
+            fi
           fi
           if [ -n "${IAC_OUTPUTS_BUCKET}" ]; then
             if [ -n "${DOMAIN_NAME}" ]; then
@@ -249,6 +257,14 @@ jobs:
             deploy_region="$(terraform -chdir=stages/enterprise output -raw region)"
             ml_ops_project="$(terraform -chdir=stages/enterprise output -raw ml_ops_project_id)"
             gcloud run jobs execute "${cpr_job_name}" --region "${deploy_region}" --project "${ml_ops_project}" --wait
+            endpoint_id="$(terraform -chdir=stages/enterprise output -raw vertex_endpoint_name 2>/dev/null || true)"
+            scorer_service_name="$(terraform -chdir=stages/enterprise output -raw scorer_service_name 2>/dev/null || true)"
+            if [ -n "${endpoint_id}" ] && [ -n "${scorer_service_name}" ]; then
+              live_psc_ip="$(gcloud ai endpoints describe "${endpoint_id}" --region="${deploy_region}" --project="${ml_ops_project}" --format='value(privateServiceConnectConfig.pscAutomationConfigs[0].ipAddress)' || true)"
+              if [ -n "${live_psc_ip}" ]; then
+                gcloud run services update "${scorer_service_name}" --region="${deploy_region}" --project="${ml_ops_project}" --update-env-vars="VERTEX_PSC_ENDPOINT_IP=${live_psc_ip}" --quiet
+              fi
+            fi
           fi
           if [ -n "${IAC_OUTPUTS_BUCKET}" ]; then
             if [ -n "${DOMAIN_NAME}" ]; then
@@ -384,6 +400,14 @@ jobs:
             deploy_region="$(terraform -chdir=stages/enterprise output -raw region)"
             ml_ops_project="$(terraform -chdir=stages/enterprise output -raw ml_ops_project_id)"
             gcloud run jobs execute "${cpr_job_name}" --region "${deploy_region}" --project "${ml_ops_project}" --wait
+            endpoint_id="$(terraform -chdir=stages/enterprise output -raw vertex_endpoint_name 2>/dev/null || true)"
+            scorer_service_name="$(terraform -chdir=stages/enterprise output -raw scorer_service_name 2>/dev/null || true)"
+            if [ -n "${endpoint_id}" ] && [ -n "${scorer_service_name}" ]; then
+              live_psc_ip="$(gcloud ai endpoints describe "${endpoint_id}" --region="${deploy_region}" --project="${ml_ops_project}" --format='value(privateServiceConnectConfig.pscAutomationConfigs[0].ipAddress)' || true)"
+              if [ -n "${live_psc_ip}" ]; then
+                gcloud run services update "${scorer_service_name}" --region="${deploy_region}" --project="${ml_ops_project}" --update-env-vars="VERTEX_PSC_ENDPOINT_IP=${live_psc_ip}" --quiet
+              fi
+            fi
           fi
           if [ -n "${IAC_OUTPUTS_BUCKET}" ]; then
             if [ -n "${DOMAIN_NAME}" ]; then

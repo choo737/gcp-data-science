@@ -38,6 +38,7 @@ locals {
   effective_vpc_id         = var.vpc_id != null ? trimspace(var.vpc_id) : ""
   effective_subnet_id      = var.egress_connector_subnet_id != null ? trimspace(var.egress_connector_subnet_id) : ""
   use_direct_vpc           = local.effective_vpc_id != "" && local.effective_subnet_id != ""
+  network_project_id       = local.effective_vpc_id != "" ? try(regex("^projects/([^/]+)/global/networks/", local.effective_vpc_id)[0], var.project_id) : var.project_id
   enable_online_track      = contains(["vertex_cpr_online", "both"], var.ds_serving_track)
   enable_bqml_track        = contains(["bqml_batch", "both"], var.ds_serving_track)
 
@@ -55,10 +56,9 @@ locals {
       "bigquerystorage.googleapis.com",
       "iam.googleapis.com",
     ],
-    local.enable_online_track && var.enable_scorer_service ? ["run.googleapis.com"] : [],
+    local.enable_online_track && (var.enable_scorer_service || var.deploy_cpr_model) ? ["run.googleapis.com"] : [],
     local.enable_bqml_track ? ["workflows.googleapis.com", "workflowexecutions.googleapis.com", "pubsub.googleapis.com"] : [],
     local.enable_bqml_track && var.enable_bqml_schedule ? ["cloudscheduler.googleapis.com"] : [],
-    local.use_direct_vpc ? ["networkconnectivity.googleapis.com"] : [],
     length(var.alert_notification_channel_ids) > 0 ? ["monitoring.googleapis.com"] : [],
   ))
 
@@ -106,8 +106,22 @@ resource "time_sleep" "api_propagation" {
   depends_on = [google_project_service.apis]
 }
 
+resource "google_project_service" "network_connectivity_api" {
+  count = local.use_direct_vpc ? 1 : 0
+
+  project            = local.network_project_id
+  service            = "networkconnectivity.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "time_sleep" "network_api_propagation" {
+  count           = local.use_direct_vpc ? 1 : 0
+  create_duration = local.propagation_wait_seconds
+
+  depends_on = [google_project_service.network_connectivity_api]
+}
+
 resource "google_project_service_identity" "aiplatform_agent" {
-  count    = local.use_cmek && var.manage_kms_iam ? 1 : 0
   provider = google-beta
   project  = var.project_id
   service  = "aiplatform.googleapis.com"
@@ -116,7 +130,7 @@ resource "google_project_service_identity" "aiplatform_agent" {
 }
 
 resource "google_project_service_identity" "run_agent" {
-  count    = local.use_cmek && var.manage_kms_iam && local.enable_online_track && var.enable_scorer_service ? 1 : 0
+  count    = local.use_cmek && var.manage_kms_iam && local.enable_online_track && (var.enable_scorer_service || var.deploy_cpr_model) ? 1 : 0
   provider = google-beta
   project  = var.project_id
   service  = "run.googleapis.com"
@@ -152,7 +166,6 @@ resource "google_project_service_identity" "artifactregistry_agent" {
 }
 
 resource "time_sleep" "service_identity_propagation" {
-  count           = local.use_cmek && var.manage_kms_iam ? 1 : 0
   create_duration = local.propagation_wait_seconds
 
   depends_on = [
@@ -166,18 +179,26 @@ resource "time_sleep" "service_identity_propagation" {
   ]
 }
 
+resource "google_project_iam_member" "aiplatform_bq_job_user" {
+  project = var.project_id
+  role    = "roles/bigquery.jobUser"
+  member  = google_project_service_identity.aiplatform_agent.member
+
+  depends_on = [time_sleep.service_identity_propagation]
+}
+
 resource "google_kms_crypto_key_iam_member" "aiplatform_cmek" {
   count = local.use_cmek && var.manage_kms_iam ? 1 : 0
 
   crypto_key_id = local.effective_kms_key_id
   role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
-  member        = google_project_service_identity.aiplatform_agent[0].member
+  member        = google_project_service_identity.aiplatform_agent.member
 
   depends_on = [time_sleep.service_identity_propagation]
 }
 
 resource "google_kms_crypto_key_iam_member" "run_cmek" {
-  count = local.use_cmek && var.manage_kms_iam && local.enable_online_track && var.enable_scorer_service ? 1 : 0
+  count = local.use_cmek && var.manage_kms_iam && local.enable_online_track && (var.enable_scorer_service || var.deploy_cpr_model) ? 1 : 0
 
   crypto_key_id = local.effective_kms_key_id
   role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
@@ -255,7 +276,7 @@ resource "time_sleep" "cmek_propagation" {
 resource "google_network_connectivity_service_connection_policy" "vertex_psc" {
   count = local.use_direct_vpc ? 1 : 0
 
-  project       = var.project_id
+  project       = local.network_project_id
   name          = "${replace(lower(var.prefix), "_", "-")}-vertex-psc-policy"
   location      = var.region
   service_class = "gcp-vertexai"
@@ -266,7 +287,7 @@ resource "google_network_connectivity_service_connection_policy" "vertex_psc" {
     subnetworks = [local.effective_subnet_id]
   }
 
-  depends_on = [time_sleep.api_propagation]
+  depends_on = [time_sleep.network_api_propagation]
 }
 
 resource "google_bigquery_dataset" "silver" {
@@ -397,8 +418,10 @@ module "feature_store" {
 
   depends_on = [
     time_sleep.api_propagation,
+    time_sleep.service_identity_propagation,
     time_sleep.cmek_propagation,
     google_bigquery_dataset.silver,
+    google_project_iam_member.aiplatform_bq_job_user,
   ]
 }
 

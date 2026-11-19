@@ -13,8 +13,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -22,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.deploy_cpr_endpoint import parse_deploy_config
 from src.cpr_treeshap.deploy_cpr import deploy_cpr_model
+import src.cpr_treeshap.predictor as cpr_predictor
 from src.cpr_treeshap.predictor import (
     REASON_RULE_VERSION,
     TreeShapCprPredictor,
@@ -44,6 +46,7 @@ from src.scorer_service.app import (
     build_vertex_predict_url,
     create_scorer_wsgi_app,
     format_adverse_reasons_for_agent,
+    invalidate_psc_cache,
 )
 from src.scorer_service.ledger_writer import (
     LOCKED_LEDGER_COLUMNS,
@@ -565,7 +568,11 @@ class TreeShapAndMrmTest(unittest.TestCase):
             build_vertex_predict_url(prod_no_psc)
 
         writer = FailClosedLedgerWriter(project_id="ml-ops-proj", dataset_id="ml_xai_audit", write_client=MagicMock())
-        svc = ScoringService(config=prod_no_psc, ledger_writer=writer)
+        svc = ScoringService(
+            config=prod_no_psc,
+            ledger_writer=writer,
+            endpoint_metadata_fetcher=lambda _c: {"privateServiceConnectConfig": {"pscAutomationConfigs": []}},
+        )
         status, body = svc.score_applicant({"entity_id": "ent-1", "features": {"tenure_months": 12}})
         self.assertEqual(status, 503)
         self.assertFalse(body["decision_released"])
@@ -659,6 +666,10 @@ class TreeShapAndMrmTest(unittest.TestCase):
         self.assertTrue(upload_url.endswith("/projects/ml-ops-proj/locations/asia-southeast1/models:upload"))
         env_items = {e["name"]: e["value"] for e in upload_kwargs["json"]["model"]["containerSpec"]["env"]}
         self.assertEqual(env_items["EXPECTED_MODEL_SHA256"], "c" * 64)
+        self.assertEqual(
+            env_items["CONTAINER_IMAGE_DIGEST"],
+            "asia-southeast1-docker.pkg.dev/ml-ops-proj/repo/cpr@sha256:" + "a" * 64,
+        )
         deploy_url, deploy_kwargs = session.post.call_args_list[1][0][0], session.post.call_args_list[1][1]
         self.assertTrue(deploy_url.endswith("/endpoints/1004200001:deployModel"))
         self.assertEqual(deploy_kwargs["json"]["trafficSplit"], {"0": 100})
@@ -702,6 +713,225 @@ class TreeShapAndMrmTest(unittest.TestCase):
         })
         with self.assertRaisesRegex(RuntimeError, "Vertex AI operation failed"):
             deploy_cpr_model(cfg, session=err_session, sleep_fn=lambda _s: None, poll_interval_seconds=0.0)
+
+    def test_psc_lazy_discovery_cache_fail_closed_and_stale_refresh(self) -> None:
+        invalidate_psc_cache()
+        try:
+            prod_cfg = ScoringConfig(
+                ml_ops_project_id="ml-ops-proj",
+                region="asia-southeast1",
+                vertex_endpoint_id="1004200001",
+                ml_audit_dataset_id="ml_xai_audit",
+                vertex_psc_endpoint_ip="",
+                environment="prod",
+            )
+            ok_prediction = {
+                "predictions": [
+                    {
+                        "entity_id": "ent-100",
+                        "model_id": "credit_xgb_cpr",
+                        "model_version_id": "v1",
+                        "model_artifact_sha256": "a" * 64,
+                        "container_image_digest": "sha256:" + "b" * 64,
+                        "schema_version": "v1",
+                        "explained_class": "APPROVE",
+                        "approve_prob": 0.80,
+                        "raw_margin": 1.386294,
+                        "base_logit": 0.50,
+                        "shap_sum_logit": 0.886294,
+                        "shap_logit_map": {"tenure_months": 0.886294},
+                        "top_adverse_reasons": [],
+                        "feature_payload": {"tenure_months": 24},
+                        "reason_rule_version": REASON_RULE_VERSION,
+                    }
+                ]
+            }
+
+            # (a) Empty VERTEX_PSC_ENDPOINT_IP in prod succeeds via control-plane discovery and caches.
+            write_client = MagicMock()
+            write_client.append_rows.side_effect = lambda reqs: iter([MagicMock(row_errors=[], error=None)])
+            writer = FailClosedLedgerWriter(project_id="ml-ops-proj", dataset_id="ml_xai_audit", write_client=write_client)
+
+            fetcher = MagicMock(return_value={
+                "privateServiceConnectConfig": {
+                    "pscAutomationConfigs": [
+                        {"state": "PSC_AUTOMATION_STATE_PENDING", "ipAddress": ""},
+                        {"state": "PSC_AUTOMATION_STATE_SUCCESSFUL", "ipAddress": "10.10.0.25"},
+                    ]
+                }
+            })
+            seen_urls: list[str] = []
+
+            def _post_ok(url: str, _inst: object) -> dict[str, object]:
+                seen_urls.append(url)
+                return ok_prediction
+
+            svc = ScoringService(
+                config=prod_cfg,
+                ledger_writer=writer,
+                endpoint_metadata_fetcher=fetcher,
+                http_post_fn=_post_ok,
+            )
+            s1, b1 = svc.score_applicant({"entity_id": "ent-100", "features": {"tenure_months": 24}})
+            s2, b2 = svc.score_applicant({"entity_id": "ent-100", "features": {"tenure_months": 24}})
+            self.assertEqual(s1, 200)
+            self.assertEqual(s2, 200)
+            self.assertTrue(b1["ledger_committed"])
+            self.assertTrue(b2["ledger_committed"])
+            self.assertEqual(fetcher.call_count, 1)
+            self.assertEqual(
+                seen_urls,
+                [
+                    "http://10.10.0.25/v1/projects/ml-ops-proj/locations/asia-southeast1/endpoints/1004200001:predict",
+                    "http://10.10.0.25/v1/projects/ml-ops-proj/locations/asia-southeast1/endpoints/1004200001:predict",
+                ],
+            )
+
+            # (b) Empty ipAddress in prod fails closed (503) and does NOT permanently cache "".
+            invalidate_psc_cache(prod_cfg)
+            dynamic_fetcher = MagicMock(side_effect=[
+                {"privateServiceConnectConfig": {"pscAutomationConfigs": [{"ipAddress": ""}]}},
+                {"privateServiceConnectConfig": {"pscAutomationConfigs": [{"ipAddress": "10.10.0.26"}]}},
+            ])
+            seen_urls.clear()
+            svc_dyn = ScoringService(
+                config=prod_cfg,
+                ledger_writer=writer,
+                endpoint_metadata_fetcher=dynamic_fetcher,
+                http_post_fn=_post_ok,
+            )
+            s_fail, b_fail = svc_dyn.score_applicant({"entity_id": "ent-100", "features": {"tenure_months": 24}})
+            self.assertEqual(s_fail, 503)
+            self.assertFalse(b_fail["decision_released"])
+            s_recover, _ = svc_dyn.score_applicant({"entity_id": "ent-100", "features": {"tenure_months": 24}})
+            self.assertEqual(s_recover, 200)
+            self.assertEqual(dynamic_fetcher.call_count, 2)
+            self.assertTrue(seen_urls[0].startswith("http://10.10.0.26/"))
+
+            # (c) ConnectionError on stale cached IP invalidates cache and refreshes once.
+            stale_attempts: list[str] = []
+
+            def _post_stale_then_ok(url: str, _inst: object) -> dict[str, object]:
+                stale_attempts.append(url)
+                if "10.10.0.26" in url:
+                    raise ConnectionError("stale PSC endpoint IP")
+                return ok_prediction
+
+            refresh_fetcher = MagicMock(return_value={
+                "privateServiceConnectConfig": {
+                    "pscAutomationConfigs": [{"state": "PSC_AUTOMATION_STATE_SUCCESSFUL", "ipAddress": "10.10.0.30"}]
+                }
+            })
+            svc_refresh = ScoringService(
+                config=prod_cfg,
+                ledger_writer=writer,
+                endpoint_metadata_fetcher=refresh_fetcher,
+                http_post_fn=_post_stale_then_ok,
+            )
+            s_ref, _ = svc_refresh.score_applicant({"entity_id": "ent-100", "features": {"tenure_months": 24}})
+            self.assertEqual(s_ref, 200)
+            self.assertEqual(refresh_fetcher.call_count, 1)
+            self.assertEqual(len(stale_attempts), 2)
+            self.assertTrue(stale_attempts[0].startswith("http://10.10.0.26/"))
+            self.assertTrue(stale_attempts[1].startswith("http://10.10.0.30/"))
+        finally:
+            invalidate_psc_cache()
+
+    def test_cpr_thread_safe_lazy_init_and_non_blocking_health(self) -> None:
+        env_keys = (
+            "AIP_STORAGE_URI",
+            "MODEL_PATH",
+            "EXPECTED_MODEL_SHA256",
+            "FEATURE_NAMES",
+            "MODEL_FILENAME",
+        )
+        saved_env = {k: os.environ.get(k) for k in env_keys}
+        saved_lazy = cpr_predictor._LAZY_CPR_APP
+        try:
+            cpr_predictor._LAZY_CPR_APP = None
+
+            # Missing env on /health returns 500 Internal Server Error.
+            for k in env_keys:
+                os.environ.pop(k, None)
+            err_statuses: list[str] = []
+            cpr_predictor.application(
+                {"PATH_INFO": "/health", "REQUEST_METHOD": "GET"},
+                lambda s, _h: err_statuses.append(s),
+            )
+            self.assertEqual(err_statuses[0], "500 Internal Server Error")
+
+            # Cold gs:// AIP_STORAGE_URI on /health returns 200 without invoking GCS download.
+            os.environ["AIP_STORAGE_URI"] = "gs://ml-models/run-1"
+            os.environ["EXPECTED_MODEL_SHA256"] = "a" * 64
+            os.environ["FEATURE_NAMES"] = '["tenure_months"]'
+            with patch.object(cpr_predictor.TreeShapCprPredictor, "load_from_file") as mock_load:
+                health_statuses: list[str] = []
+                chunks = cpr_predictor.application(
+                    {"PATH_INFO": "/health", "REQUEST_METHOD": "GET"},
+                    lambda s, _h: health_statuses.append(s),
+                )
+                self.assertEqual(health_statuses[0], "200 OK")
+                payload = json.loads(b"".join(chunks).decode("utf-8"))
+                self.assertEqual(payload["status"], "healthy")
+                self.assertFalse(payload["model_loaded"])
+                mock_load.assert_not_called()
+
+            # Concurrent requests trigger load_from_file exactly once under _LAZY_CPR_LOCK.
+            cpr_predictor._LAZY_CPR_APP = None
+            os.environ.pop("AIP_STORAGE_URI", None)
+            with tempfile.TemporaryDirectory() as td:
+                model_path = Path(td) / "model.ubj"
+                model_path.write_bytes(b"stub-bytes")
+                os.environ["MODEL_PATH"] = str(model_path)
+                os.environ["EXPECTED_MODEL_SHA256"] = hashlib.sha256(b"stub-bytes").hexdigest()
+
+                booster = _Float32BoosterAdapter(margin_f32=_float32(0.30), contribs_f32=[_float32(0.20), _float32(0.10)])
+                fake_pred = TreeShapCprPredictor(
+                    booster=booster,
+                    feature_names=["tenure_months"],
+                    model_id="credit_xgb_cpr",
+                    model_version_id="v1",
+                    model_artifact_sha256="a" * 64,
+                    container_image_digest="sha256:" + "b" * 64,
+                    dmatrix_factory=lambda rows, feature_names: rows,
+                )
+
+                barrier = threading.Barrier(4)
+                results: list[str] = []
+                lock = threading.Lock()
+
+                with patch.object(cpr_predictor.TreeShapCprPredictor, "load_from_file", return_value=fake_pred) as mock_load:
+                    def _worker() -> None:
+                        barrier.wait()
+                        statuses: list[str] = []
+                        req = json.dumps({"instances": [{"tenure_months": 18}]}).encode("utf-8")
+                        cpr_predictor.application(
+                            {
+                                "PATH_INFO": "/predict",
+                                "REQUEST_METHOD": "POST",
+                                "CONTENT_LENGTH": str(len(req)),
+                                "wsgi.input": io.BytesIO(req),
+                            },
+                            lambda s, _h: statuses.append(s),
+                        )
+                        with lock:
+                            results.append(statuses[0])
+
+                    threads = [threading.Thread(target=_worker) for _ in range(4)]
+                    for t in threads:
+                        t.start()
+                    for t in threads:
+                        t.join()
+
+                    self.assertEqual(mock_load.call_count, 1)
+                    self.assertEqual(results, ["200 OK"] * 4)
+        finally:
+            cpr_predictor._LAZY_CPR_APP = saved_lazy
+            for k, val in saved_env.items():
+                if val is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = val
 
 
 if __name__ == "__main__":

@@ -262,9 +262,16 @@ def resolve_backend_prefix(raw_src: str, src_abs: Path, env: str) -> str:
         if domain_name:
             return f"data-science/{domain_name}/{rel_stage}/{env}"
         return f"data-science/{rel_stage}/{env}"
-    if domain_name:
-        return f"{domain_name}/{rel_stage}/{env}"
+    if rel_stage == "foundation/01-org-governance":
+        return "foundation/01-org-governance/shared"
     return f"{rel_stage}/{env}"
+
+
+def stage_uses_gcs_backend(stage_abs: Path) -> bool:
+    if (stage_abs / "envs").is_dir():
+        return True
+    versions_tf = stage_abs / "versions.tf"
+    return versions_tf.is_file() and 'backend "gcs"' in versions_tf.read_text(encoding="utf-8")
 
 
 def read_stage_outputs(raw_src: str, env: str, state_bucket: str) -> dict[str, object]:
@@ -281,7 +288,7 @@ def read_stage_outputs(raw_src: str, env: str, state_bucket: str) -> dict[str, o
     if env and (effective_src / "terraform.tfstate.d" / env).is_dir():
         cmd_env["TF_WORKSPACE"] = env
 
-    if env and state_bucket and (effective_src / "envs").is_dir():
+    if env and state_bucket and stage_uses_gcs_backend(effective_src):
         backend_prefix = resolve_backend_prefix(raw_src, effective_src.resolve(), env)
         subprocess.run(
             [
@@ -520,9 +527,16 @@ def resolve_backend_prefix(raw_src: str, src_abs: Path, env: str) -> str:
         if domain_name:
             return f"data-science/{domain_name}/{rel_stage}/{env}"
         return f"data-science/{rel_stage}/{env}"
-    if domain_name:
-        return f"{domain_name}/{rel_stage}/{env}"
+    if rel_stage == "foundation/01-org-governance":
+        return "foundation/01-org-governance/shared"
     return f"{rel_stage}/{env}"
+
+
+def stage_uses_gcs_backend(stage_abs: Path) -> bool:
+    if (stage_abs / "envs").is_dir():
+        return True
+    versions_tf = stage_abs / "versions.tf"
+    return versions_tf.is_file() and 'backend "gcs"' in versions_tf.read_text(encoding="utf-8")
 
 
 def read_stage_outputs(raw_src: str, env: str, state_bucket: str) -> dict[str, object]:
@@ -539,7 +553,7 @@ def read_stage_outputs(raw_src: str, env: str, state_bucket: str) -> dict[str, o
     if env and (effective_src / "terraform.tfstate.d" / env).is_dir():
         cmd_env["TF_WORKSPACE"] = env
 
-    if env and state_bucket and (effective_src / "envs").is_dir():
+    if env and state_bucket and stage_uses_gcs_backend(effective_src):
         backend_prefix = resolve_backend_prefix(raw_src, effective_src.resolve(), env)
         subprocess.run(
             [

@@ -153,6 +153,7 @@ def deploy_cpr_model(
         "EXPECTED_MODEL_SHA256": expected_sha256,
         "FEATURE_NAMES": json.dumps(list(config["feature_names"])),
         "MODEL_ID": display_name,
+        "CONTAINER_IMAGE_DIGEST": str(config["cpr_container_image"]),
         "REASON_RULE_VERSION": str(config["reason_rule_version"]),
         "SHAP_ADDITIVITY_TOLERANCE": str(config["additivity_tolerance"]),
     }

@@ -8,7 +8,9 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
+import threading
 from typing import Any, Callable, Mapping, Sequence
 
 # Lock OpenMP thread count to 1 for deterministic TreeSHAP floating-point reduction.
@@ -22,6 +24,7 @@ RESTRICTED_PII_KEYS: frozenset[str] = frozenset({
 
 REASON_RULE_VERSION = "bnm-fair-lending-v1.0"
 SCHEMA_VERSION = "v1"
+_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 DEFAULT_ADVERSE_REASON_CODES: dict[str, tuple[str, str]] = {
     "tenure_months": (
@@ -347,8 +350,8 @@ def create_cpr_wsgi_app(predictor: TreeShapCprPredictor) -> Callable[..., list[b
         path = environ.get("PATH_INFO", "/")
         method = environ.get("REQUEST_METHOD", "GET").upper()
 
-        if path == "/health" and method == "GET":
-            body = json.dumps({"status": "ok", "omp_num_threads": os.environ.get("OMP_NUM_THREADS")}).encode("utf-8")
+        if path in ("/health", "/healthz") and method == "GET":
+            body = json.dumps({"status": "ok", "model_loaded": True, "omp_num_threads": os.environ.get("OMP_NUM_THREADS")}).encode("utf-8")
             start_response("200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
             return [body]
 
@@ -382,27 +385,64 @@ def resolve_model_source_from_env() -> str:
     return os.environ.get("MODEL_PATH", "").strip()
 
 
+def _validate_cpr_env() -> tuple[str, str, list[str]]:
+    model_source = resolve_model_source_from_env()
+    expected_sha = os.environ.get("EXPECTED_MODEL_SHA256", "").strip()
+    feature_names = parse_feature_names(os.environ.get("FEATURE_NAMES", ""))
+    if not model_source or not expected_sha or not feature_names:
+        raise RuntimeError("AIP_STORAGE_URI or MODEL_PATH, EXPECTED_MODEL_SHA256, and FEATURE_NAMES are required.")
+    if not _SHA256_HEX_RE.fullmatch(expected_sha):
+        raise ValueError("EXPECTED_MODEL_SHA256 must be a 64-character hex digest.")
+    return model_source, expected_sha.lower(), feature_names
+
+
 _LAZY_CPR_APP: Callable[..., list[bytes]] | None = None
+_LAZY_CPR_LOCK = threading.Lock()
+
+
+def _ensure_cpr_app_loaded() -> Callable[..., list[bytes]]:
+    global _LAZY_CPR_APP
+    if _LAZY_CPR_APP is None:
+        with _LAZY_CPR_LOCK:
+            if _LAZY_CPR_APP is None:
+                model_source, expected_sha, feature_names = _validate_cpr_env()
+                predictor = TreeShapCprPredictor.load_from_file(
+                    model_path=model_source,
+                    expected_sha256=expected_sha,
+                    feature_names=feature_names,
+                    model_id=os.environ.get("MODEL_ID", "credit_xgb_cpr"),
+                    model_version_id=os.environ.get("MODEL_VERSION_ID", "1"),
+                    container_image_digest=os.environ.get("CONTAINER_IMAGE_DIGEST", "unpinned"),
+                    additivity_tolerance=float(os.environ.get("SHAP_ADDITIVITY_TOLERANCE", "0.00001")),
+                    reason_rule_version=os.environ.get("REASON_RULE_VERSION", REASON_RULE_VERSION),
+                )
+                _LAZY_CPR_APP = create_cpr_wsgi_app(predictor)
+    return _LAZY_CPR_APP
 
 
 def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> list[bytes]:
-    """Lazy Gunicorn WSGI entrypoint loading a SHA-256 verified XGBoost artifact."""
-    global _LAZY_CPR_APP
-    if _LAZY_CPR_APP is None:
-        model_source = resolve_model_source_from_env()
-        expected_sha = os.environ.get("EXPECTED_MODEL_SHA256", "").strip()
-        feature_names = parse_feature_names(os.environ.get("FEATURE_NAMES", ""))
-        if not model_source or not expected_sha or not feature_names:
-            raise RuntimeError("AIP_STORAGE_URI or MODEL_PATH, EXPECTED_MODEL_SHA256, and FEATURE_NAMES are required.")
-        predictor = TreeShapCprPredictor.load_from_file(
-            model_path=model_source,
-            expected_sha256=expected_sha,
-            feature_names=feature_names,
-            model_id=os.environ.get("MODEL_ID", "credit_xgb_cpr"),
-            model_version_id=os.environ.get("MODEL_VERSION_ID", "1"),
-            container_image_digest=os.environ.get("CONTAINER_IMAGE_DIGEST", "unpinned"),
-            additivity_tolerance=float(os.environ.get("SHAP_ADDITIVITY_TOLERANCE", "0.00001")),
-            reason_rule_version=os.environ.get("REASON_RULE_VERSION", REASON_RULE_VERSION),
-        )
-        _LAZY_CPR_APP = create_cpr_wsgi_app(predictor)
-    return _LAZY_CPR_APP(environ, start_response)
+    """Thread-safe lazy Gunicorn WSGI entrypoint with non-blocking health checks."""
+    path = environ.get("PATH_INFO", "/")
+    method = environ.get("REQUEST_METHOD", "GET").upper()
+
+    if path in ("/health", "/healthz") and method == "GET":
+        if _LAZY_CPR_APP is not None:
+            return _LAZY_CPR_APP(environ, start_response)
+        try:
+            model_source, _, _ = _validate_cpr_env()
+        except Exception as exc:  # noqa: BLE001
+            body = json.dumps({"status": "error", "error": str(exc)}).encode("utf-8")
+            start_response("500 Internal Server Error", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
+            return [body]
+
+        if model_source.startswith("gs://"):
+            body = json.dumps({
+                "status": "healthy",
+                "model_loaded": False,
+                "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+            }).encode("utf-8")
+            start_response("200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
+            return [body]
+
+    app_fn = _ensure_cpr_app_loaded()
+    return app_fn(environ, start_response)

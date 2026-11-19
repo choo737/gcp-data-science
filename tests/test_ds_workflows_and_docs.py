@@ -102,6 +102,9 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
         self.assertIn("ALLOW_INFRA_ONLY_PROD_APPLY", deploy_text)
         self.assertIn("MRM_EVAL_INPUT_JSON is missing or unreadable; prod apply blocked (fail-closed).", deploy_text)
         self.assertIn("gcloud run jobs execute", deploy_text)
+        self.assertIn("gcloud ai endpoints describe", deploy_text)
+        self.assertIn("gcloud run services update", deploy_text)
+        self.assertIn("VERTEX_PSC_ENDPOINT_IP=", deploy_text)
         self.assertIn("GCP_DS_WIF_SA || vars.GCP_WIF_SERVICE_ACCOUNT", deploy_text)
         self.assertIn("data-science/data-science-outputs.json", deploy_text)
         self.assertIn('data-science/${DOMAIN_NAME}/data-science-outputs.json', deploy_text)
@@ -237,9 +240,9 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
 
         try:
             from kfp import compiler  # type: ignore
-            from src.pipelines.credit_scoring_kfp import credit_scoring_xai_pipeline
+            from src.pipelines.credit_scoring_kfp import build_credit_scoring_pipeline, credit_scoring_xai_pipeline
         except ImportError:
-            return
+            self.skipTest("kfp package not installed in bare stdlib test runner")
 
         with tempfile.TemporaryDirectory() as td:
             pkg_path = Path(td) / "credit_scoring_xai_pipeline.yaml"
@@ -247,6 +250,18 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
             compiled = pkg_path.read_text(encoding="utf-8")
             self.assertIn("evaluate-mrm-gate", compiled)
             self.assertIn("register-cpr-model", compiled)
+            self.assertIn("vw_ml_customer_features_online", compiled)
+            self.assertIn("CONTAINER_IMAGE_DIGEST", compiled)
+            self.assertIn("SHAP_ADDITIVITY_TOLERANCE", compiled)
+
+            custom_pipeline = build_credit_scoring_pipeline(
+                pipeline_name="custom-credit-xai",
+                feature_columns=["tenure_months", "avg_monthly_spend"],
+            )
+            custom_path = Path(td) / "custom_pipeline.yaml"
+            compiler.Compiler().compile(pipeline_func=custom_pipeline, package_path=str(custom_path))
+            custom_yaml = custom_path.read_text(encoding="utf-8")
+            self.assertIn("custom-credit-xai", custom_yaml)
 
     def test_enterprise_and_sandbox_ledger_schemas_contain_18_columns(self) -> None:
         for stage in ("enterprise", "sandbox"):
@@ -372,16 +387,21 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
             (ext_repo / ".git").mkdir(parents=True)
             ext_stage = ext_repo / "data" / "enterprise" / "03-data-science"
             (ext_stage / "envs").mkdir(parents=True)
+            org_stage = ext_repo / "foundation" / "01-org-governance"
+            (org_stage / "envs").mkdir(parents=True)
 
             ext_res = subprocess.run(
                 [
                     str(script_path),
                     "--env",
-                    "staging",
+                    "dev",
+                    "--domain-name",
+                    "retail",
                     "--tfstate-bucket",
                     "state-bkt",
                     "--from-local",
                     str(ext_stage),
+                    str(org_stage),
                     str(dst),
                 ],
                 env=env,
@@ -397,6 +417,8 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
                     str(script_path),
                     "--env",
                     "staging",
+                    "--domain-name",
+                    "retail",
                     "--tfstate-bucket",
                     "state-bkt",
                     str(int_stage_envs),
@@ -411,10 +433,12 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
 
             log_lines = tf_log.read_text(encoding="utf-8").splitlines()
             init_lines = [line for line in log_lines if " init " in line]
-            self.assertTrue(any("-backend-config=prefix=data/enterprise/03-data-science/staging" in l for l in init_lines), init_lines)
+            self.assertTrue(any("-backend-config=prefix=data/enterprise/03-data-science/dev" in l for l in init_lines), init_lines)
+            self.assertTrue(any("-backend-config=prefix=foundation/01-org-governance/shared" in l for l in init_lines), init_lines)
+            self.assertFalse(any("retail/data/enterprise/03-data-science" in l for l in init_lines), init_lines)
             self.assertFalse(any("data-science/data/enterprise/03-data-science" in l for l in init_lines), init_lines)
             self.assertFalse(any(".." in l for l in init_lines), init_lines)
-            self.assertTrue(any("-backend-config=prefix=data-science/enterprise/staging" in l for l in init_lines), init_lines)
+            self.assertTrue(any("-backend-config=prefix=data-science/retail/enterprise/staging" in l for l in init_lines), init_lines)
 
 
 if __name__ == "__main__":

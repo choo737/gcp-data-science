@@ -45,7 +45,7 @@ Populate `stages/enterprise/00_linked.auto.tfvars.json` directly or via `gcp-lau
 | `core_project_id` | Required | Project hosting BigQuery Silver feature tables | `core_storage_project_id` |
 | `ds_exp_project_id` | Required | Data science experimentation project allowlisted for PSC | — |
 | `ml_ops_project_id` | Required | Project hosting Feature Store, Endpoint, and Scorer | — |
-| `silver_dataset_id` | Required | Silver dataset hosting `ml_customer_features` | — |
+| `silver_dataset_id` | Required | Silver dataset hosting `vw_ml_customer_features_online` | — |
 | `ml_audit_dataset_id` | Required | BigQuery dataset hosting `ml_xai_audit_ledger` | — |
 | `ml_artifact_repo_id` | Required | Artifact Registry repository storing CPR and scorer images | — |
 | `kms_key_id` | Optional | Regional Cloud KMS CryptoKey ID for CMEK | `kms_key_name` |
@@ -65,7 +65,7 @@ Choose Track A, Track B, or both inside `stages/enterprise/envs/<env>.tfvars`.
 | Online Store Toggle | `enable_online_feature_store` | `false` | Uses Bigtable autoscaling; blocked in `asia-southeast2` |
 | Online Store Nodes | `feature_online_store_min_nodes` | `1` | Scale up to `feature_online_store_max_nodes` (`2`) |
 | Feature Sync Cron | `feature_sync_cron` | `"TZ=Asia/Singapore 0 * * * *"` | Cron schedule syncing FeatureView from BigQuery |
-| Source Feature Table | `feature_group_source_table` | `"ml_customer_features"` | Silver table with `entity_id` key |
+| Source Feature Table | `feature_group_source_table` | `"vw_ml_customer_features_online"` | Silver view with `entity_id` key |
 
 ---
 

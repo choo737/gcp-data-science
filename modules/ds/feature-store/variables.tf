@@ -20,8 +20,8 @@ variable "silver_dataset_id" {
 
 variable "feature_group_source_table" {
   type        = string
-  default     = "ml_customer_features"
-  description = "BigQuery Silver table or view backing the Feature Group."
+  default     = "vw_ml_customer_features_online"
+  description = "BigQuery Silver view or table backing the Feature Group."
 }
 
 variable "entity_id_columns" {

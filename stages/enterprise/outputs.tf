@@ -53,6 +53,11 @@ output "cpr_deployer_job_name" {
   description = "Cloud Run v2 job name that uploads and deploys the CPR model when enabled."
 }
 
+output "scorer_service_name" {
+  value       = try(module.xai_serving_endpoint[0].scorer_service_name, "")
+  description = "Internal Cloud Run v2 XAI scorer service name when enabled."
+}
+
 output "scorer_service_uri" {
   value       = try(module.xai_serving_endpoint[0].scorer_service_uri, "")
   description = "Internal Cloud Run v2 XAI scorer service URI when enabled."

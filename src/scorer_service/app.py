@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
+import threading
+import time
 from typing import Any, Callable, Mapping
 
 try:
@@ -26,6 +28,10 @@ except ImportError:
             FailClosedLedgerWriter,
             LedgerCommitError,
         )
+
+_PSC_CACHE_TTL_SECONDS = 300.0
+_PSC_DISCOVERY_LOCK = threading.Lock()
+_PSC_CACHE: dict[tuple[str, str, str], tuple[str, float]] = {}
 
 
 class PscEndpointRequiredError(RuntimeError):
@@ -76,9 +82,93 @@ class ScoringConfig:
         )
 
 
-def build_vertex_predict_url(config: ScoringConfig) -> str:
+def _psc_cache_key(config: ScoringConfig) -> tuple[str, str, str]:
+    return (config.ml_ops_project_id, config.region, config.vertex_endpoint_id)
+
+
+def invalidate_psc_cache(config: ScoringConfig | None = None) -> None:
+    """Clear cached PSC endpoint IP(s) after connection failures or during tests."""
+    with _PSC_DISCOVERY_LOCK:
+        if config is None:
+            _PSC_CACHE.clear()
+        else:
+            _PSC_CACHE.pop(_psc_cache_key(config), None)
+
+
+def extract_psc_ip_from_endpoint(endpoint_doc: Mapping[str, Any]) -> str:
+    """Extract live PSC endpoint IP from Vertex AI Endpoint metadata."""
+    psc_cfg = endpoint_doc.get("privateServiceConnectConfig", {})
+    if not isinstance(psc_cfg, Mapping):
+        return ""
+    configs = psc_cfg.get("pscAutomationConfigs", [])
+    if not isinstance(configs, list):
+        return ""
+
+    first_non_empty = ""
+    for item in configs:
+        if not isinstance(item, Mapping):
+            continue
+        ip = str(item.get("ipAddress", "")).strip()
+        if not ip:
+            continue
+        if str(item.get("state", "")).strip() == "PSC_AUTOMATION_STATE_SUCCESSFUL":
+            return ip
+        if not first_non_empty:
+            first_non_empty = ip
+    return first_non_empty
+
+
+def _default_endpoint_metadata_fetcher(config: ScoringConfig) -> Mapping[str, Any]:
+    import google.auth  # type: ignore
+    from google.auth.transport.requests import AuthorizedSession  # type: ignore
+
+    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    session = AuthorizedSession(credentials)
+    url = (
+        f"https://{config.region}-aiplatform.googleapis.com/v1/"
+        f"projects/{config.ml_ops_project_id}/locations/{config.region}/"
+        f"endpoints/{config.vertex_endpoint_id}"
+    )
+    resp = session.get(url, timeout=5.0)
+    resp.raise_for_status()
+    return dict(resp.json())
+
+
+def resolve_psc_endpoint_ip(
+    config: ScoringConfig,
+    endpoint_metadata_fetcher: Callable[[ScoringConfig], Mapping[str, Any]] | None = None,
+    force_refresh: bool = False,
+    ttl_seconds: float = _PSC_CACHE_TTL_SECONDS,
+) -> str:
+    """Resolve PSC endpoint IP from env, TTL cache, or Vertex control-plane metadata."""
+    env_ip = config.vertex_psc_endpoint_ip.strip()
+    if not force_refresh and env_ip:
+        return env_ip
+
+    key = _psc_cache_key(config)
+    with _PSC_DISCOVERY_LOCK:
+        if not force_refresh:
+            if env_ip:
+                return env_ip
+            cached = _PSC_CACHE.get(key)
+            if cached is not None:
+                cached_ip, cached_at = cached
+                if cached_ip and (time.monotonic() - cached_at) < ttl_seconds:
+                    return cached_ip
+
+        fetcher = endpoint_metadata_fetcher or _default_endpoint_metadata_fetcher
+        endpoint_doc = fetcher(config)
+        discovered_ip = extract_psc_ip_from_endpoint(endpoint_doc)
+        if discovered_ip:
+            _PSC_CACHE[key] = (discovered_ip, time.monotonic())
+            return discovered_ip
+        _PSC_CACHE.pop(key, None)
+        return ""
+
+
+def build_vertex_predict_url(config: ScoringConfig, psc_ip: str | None = None) -> str:
     """Resolve the Vertex AI :predict URL over PSC or fail closed in prod."""
-    host = config.vertex_psc_endpoint_ip.strip()
+    host = (config.vertex_psc_endpoint_ip if psc_ip is None else psc_ip).strip()
     if host:
         scheme = "https" if (host.endswith(".prediction.p.vertexai.goog") or host.endswith(":443")) else "http"
         return (
@@ -128,8 +218,7 @@ def format_adverse_reasons_for_agent(ledger_row: Mapping[str, Any]) -> dict[str,
     }
 
 
-def _default_vertex_predict(config: ScoringConfig, instance: Mapping[str, Any]) -> dict[str, Any]:
-    url = build_vertex_predict_url(config)
+def _default_http_post(url: str, instance: Mapping[str, Any]) -> dict[str, Any]:
     import google.auth  # type: ignore
     from google.auth.transport.requests import Request  # type: ignore
     import requests  # type: ignore
@@ -146,7 +235,66 @@ def _default_vertex_predict(config: ScoringConfig, instance: Mapping[str, Any]) 
         timeout=10,
     )
     resp.raise_for_status()
-    body = resp.json()
+    return dict(resp.json())
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    try:
+        import requests  # type: ignore
+
+        if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
+def _default_vertex_predict(
+    config: ScoringConfig,
+    instance: Mapping[str, Any],
+    endpoint_metadata_fetcher: Callable[[ScoringConfig], Mapping[str, Any]] | None = None,
+    http_post_fn: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    require_psc = config.environment == "prod" or config.require_psc_endpoint
+    try:
+        resolved_ip = resolve_psc_endpoint_ip(config, endpoint_metadata_fetcher=endpoint_metadata_fetcher)
+    except Exception as exc:  # noqa: BLE001
+        if require_psc:
+            raise PscEndpointRequiredError(f"Failed to discover Vertex PSC endpoint IP: {exc}") from exc
+        resolved_ip = ""
+
+    url = build_vertex_predict_url(config, psc_ip=resolved_ip)
+    post_fn = http_post_fn or _default_http_post
+
+    try:
+        body = post_fn(url, instance)
+    except Exception as exc:
+        if not resolved_ip or not _is_connection_error(exc):
+            raise
+        invalidate_psc_cache(config)
+        try:
+            refreshed_ip = resolve_psc_endpoint_ip(
+                config,
+                endpoint_metadata_fetcher=endpoint_metadata_fetcher,
+                force_refresh=True,
+            )
+        except Exception as refresh_exc:  # noqa: BLE001
+            if require_psc:
+                raise PscEndpointRequiredError(
+                    f"PSC endpoint connection failed and refresh errored: {refresh_exc}"
+                ) from exc
+            raise exc
+        if not refreshed_ip:
+            if require_psc:
+                raise PscEndpointRequiredError(
+                    "Cached PSC endpoint connection failed and control-plane returned no live IP."
+                ) from exc
+            raise exc
+        refreshed_url = build_vertex_predict_url(config, psc_ip=refreshed_ip)
+        body = post_fn(refreshed_url, instance)
+
     predictions = body.get("predictions", [])
     if not predictions:
         raise RuntimeError("Vertex AI :predict returned empty predictions list.")
@@ -161,10 +309,22 @@ class ScoringService:
         config: ScoringConfig,
         ledger_writer: FailClosedLedgerWriter,
         vertex_predict_fn: Callable[[ScoringConfig, Mapping[str, Any]], Mapping[str, Any]] | None = None,
+        endpoint_metadata_fetcher: Callable[[ScoringConfig], Mapping[str, Any]] | None = None,
+        http_post_fn: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
     ) -> None:
         self.config = config
         self.ledger_writer = ledger_writer
-        self._vertex_predict_fn = vertex_predict_fn or _default_vertex_predict
+        self._endpoint_metadata_fetcher = endpoint_metadata_fetcher
+        self._http_post_fn = http_post_fn
+        if vertex_predict_fn is not None:
+            self._vertex_predict_fn = vertex_predict_fn
+        else:
+            self._vertex_predict_fn = lambda c, inst: _default_vertex_predict(
+                c,
+                inst,
+                endpoint_metadata_fetcher=self._endpoint_metadata_fetcher,
+                http_post_fn=self._http_post_fn,
+            )
 
     def score_applicant(self, payload: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
         """Score one applicant and release decision only after synchronous ledger commit."""
@@ -240,7 +400,7 @@ def create_scorer_wsgi_app(service: ScoringService) -> Callable[..., list[bytes]
         path = environ.get("PATH_INFO", "/")
         method = environ.get("REQUEST_METHOD", "GET").upper()
 
-        if path == "/health" and method == "GET":
+        if path in ("/health", "/healthz") and method == "GET":
             body = json.dumps({"status": "ok"}).encode("utf-8")
             start_response("200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
             return [body]
@@ -271,23 +431,26 @@ def create_scorer_wsgi_app(service: ScoringService) -> Callable[..., list[bytes]
 
 
 _LAZY_APP: Callable[..., list[bytes]] | None = None
+_LAZY_APP_LOCK = threading.Lock()
 
 
 def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> list[bytes]:
-    """Lazy Gunicorn WSGI entrypoint configured from Cloud Run environment variables."""
-    if environ.get("PATH_INFO", "/") == "/health" and environ.get("REQUEST_METHOD", "GET").upper() == "GET":
+    """Thread-safe lazy Gunicorn WSGI entrypoint configured from Cloud Run env vars."""
+    if environ.get("PATH_INFO", "/") in ("/health", "/healthz") and environ.get("REQUEST_METHOD", "GET").upper() == "GET":
         body = json.dumps({"status": "ok"}).encode("utf-8")
         start_response("200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
         return [body]
 
     global _LAZY_APP
     if _LAZY_APP is None:
-        cfg = ScoringConfig.from_env()
-        writer = FailClosedLedgerWriter(
-            project_id=cfg.ml_ops_project_id,
-            dataset_id=cfg.ml_audit_dataset_id,
-            table_id=cfg.ml_audit_table_id,
-            worm_bucket_name=cfg.ml_worm_bucket_name,
-        )
-        _LAZY_APP = create_scorer_wsgi_app(ScoringService(config=cfg, ledger_writer=writer))
+        with _LAZY_APP_LOCK:
+            if _LAZY_APP is None:
+                cfg = ScoringConfig.from_env()
+                writer = FailClosedLedgerWriter(
+                    project_id=cfg.ml_ops_project_id,
+                    dataset_id=cfg.ml_audit_dataset_id,
+                    table_id=cfg.ml_audit_table_id,
+                    worm_bucket_name=cfg.ml_worm_bucket_name,
+                )
+                _LAZY_APP = create_scorer_wsgi_app(ScoringService(config=cfg, ledger_writer=writer))
     return _LAZY_APP(environ, start_response)

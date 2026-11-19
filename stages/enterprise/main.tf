@@ -36,8 +36,8 @@ locals {
       "bigquerystorage.googleapis.com",
       "iam.googleapis.com",
     ],
-    local.enable_online_track && var.enable_scorer_service ? ["run.googleapis.com"] : [],
-    local.enable_bqml_track ? ["workflows.googleapis.com", "workflowexecutions.googleapis.com"] : [],
+    local.enable_online_track && (var.enable_scorer_service || var.deploy_cpr_model) ? ["run.googleapis.com"] : [],
+    local.enable_bqml_track ? ["workflows.googleapis.com", "workflowexecutions.googleapis.com", "pubsub.googleapis.com"] : [],
     local.enable_bqml_track && var.enable_bqml_schedule ? ["cloudscheduler.googleapis.com"] : [],
     length(var.alert_notification_channel_ids) > 0 ? ["monitoring.googleapis.com"] : [],
   ))
@@ -120,7 +120,7 @@ resource "google_project_service_identity" "aiplatform_agent" {
 }
 
 resource "google_project_service_identity" "run_agent" {
-  count    = local.enable_online_track && var.enable_scorer_service ? 1 : 0
+  count    = local.enable_online_track && (var.enable_scorer_service || var.deploy_cpr_model) ? 1 : 0
   provider = google-beta
   project  = var.ml_ops_project_id
   service  = "run.googleapis.com"
@@ -158,7 +158,7 @@ resource "google_kms_crypto_key_iam_member" "aiplatform_cmek" {
 }
 
 resource "google_kms_crypto_key_iam_member" "run_cmek" {
-  count = local.use_cmek && var.manage_kms_iam && local.enable_online_track && var.enable_scorer_service ? 1 : 0
+  count = local.use_cmek && var.manage_kms_iam && local.enable_online_track && (var.enable_scorer_service || var.deploy_cpr_model) ? 1 : 0
 
   crypto_key_id = local.effective_kms_key_id
   role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
@@ -262,6 +262,14 @@ resource "google_bigquery_dataset_iam_member" "aiplatform_silver_viewer" {
   depends_on = [time_sleep.service_identity_propagation]
 }
 
+resource "google_project_iam_member" "aiplatform_bq_job_user" {
+  project = var.ml_ops_project_id
+  role    = "roles/bigquery.jobUser"
+  member  = google_project_service_identity.aiplatform_agent.member
+
+  depends_on = [time_sleep.service_identity_propagation]
+}
+
 resource "google_artifact_registry_repository_iam_member" "aiplatform_reader" {
   count = local.artifact_repo_name != "" ? 1 : 0
 
@@ -297,6 +305,7 @@ module "feature_store" {
     time_sleep.service_identity_propagation,
     time_sleep.cmek_propagation,
     google_bigquery_dataset_iam_member.aiplatform_silver_viewer,
+    google_project_iam_member.aiplatform_bq_job_user,
   ]
 }
 

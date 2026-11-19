@@ -110,8 +110,8 @@ variable "fairness_min_disparate_impact" {
 
 variable "feature_group_source_table" {
   type        = string
-  default     = "ml_customer_features"
-  description = "BigQuery Silver table or view backing the Vertex AI Feature Group."
+  default     = "vw_ml_customer_features_online"
+  description = "BigQuery Silver view or table backing the Vertex AI Feature Group."
 }
 
 variable "feature_online_store_max_nodes" {
@@ -203,7 +203,7 @@ variable "shap_additivity_tolerance" {
 
 variable "silver_dataset_id" {
   type        = string
-  description = "Upstream BigQuery Silver dataset ID hosting ml_customer_features."
+  description = "Upstream BigQuery Silver dataset ID hosting vw_ml_customer_features_online."
 }
 
 variable "vpc_id" {

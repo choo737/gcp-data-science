@@ -10,13 +10,13 @@ variable "core_project_id" {
 
 variable "silver_dataset_id" {
   type        = string
-  description = "BigQuery Silver dataset ID hosting ml_customer_features."
+  description = "BigQuery Silver dataset ID hosting vw_ml_customer_features_online."
 }
 
 variable "feature_group_source_table" {
   type        = string
-  default     = "ml_customer_features"
-  description = "BigQuery Silver feature table name."
+  default     = "vw_ml_customer_features_online"
+  description = "BigQuery Silver feature view or table name."
 }
 
 variable "ml_audit_dataset_id" {
