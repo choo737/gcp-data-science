@@ -8,6 +8,26 @@ Never commit real project IDs, KMS keys, bucket names, or model secrets to track
 
 Record answers in `stages/enterprise/envs/<env>.tfvars`, `stages/sandbox/terraform.tfvars`, or gitignored `00_linked.auto.tfvars.json`.
 
+Valid enterprise environments are `dev`, `uat`, `staging`, and `prod`.
+
+## Deterministic Agent Output Routing
+
+Map each questionnaire section to the exact Terraform file below:
+
+| Questionnaire Section | Target File | Mode |
+| --- | --- | --- |
+| Section 1 (Greenfield / Brownfield) | `stages/enterprise/00_linked.auto.tfvars.json` | Linked upstream outputs (`0600`) |
+| Section 1 (Sandbox) | `stages/sandbox/terraform.tfvars` | Single-project sandbox inputs |
+| Sections 2 and 3 | `stages/enterprise/envs/<env>.tfvars` | Tracked `dev`, `uat`, `staging`, `prod` |
+
+### Company Acronym Rule (`prefix`)
+
+Derive `prefix` as a `3-6` lowercase char company acronym from the organization name.
+
+- Strip legal suffixes (`Bhd`, `Sdn`, `Pte`, `Ltd`, `Inc`, `Corp`) when three core words remain.
+- Example: `'Example Global Retail Ltd'` -> `egr`, `'Sample Financial Group'` -> `sfg`.
+- Confirm the suggested `prefix` with the user before writing `.tfvars` files.
+
 ---
 
 ## Section 1: Upstream Landing Zone Mode

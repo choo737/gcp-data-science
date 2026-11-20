@@ -105,7 +105,7 @@ Verify gcloud auth, link stages/enterprise, deploy dev or staging, and run audit
 
 - `.github/workflows/ci.yml`: Runs Terraform formatting, `terraform validate`, and Python unit tests on pushes and PRs.
 - `.github/workflows/build-cpr-and-scorer.yml`: Builds `cpr-treeshap` and `xai-scorer` images and pushes `@sha256` digests via WIF.
-- `.github/workflows/terraform-deploy.yml`: Promotes `dev` -> `staging` -> `model-validator` gate -> `prod` and exports outputs.
+- `.github/workflows/terraform-deploy.yml`: Promotes `dev`, `uat`, and `staging` through `model-validator` to `prod`.
 
 | GitHub Variable | Example Value | Purpose |
 | --- | --- | --- |
@@ -120,7 +120,7 @@ Verify gcloud auth, link stages/enterprise, deploy dev or staging, and run audit
 - `assets/`: Cloud City Layer 04 visual architecture plate.
 - `modules/ds/`: Five-file Terraform modules (`feature-store`, `xai-serving-endpoint`, `bqml-xai-pipeline`).
 - `stages/sandbox/`: Single-project stage with GCS backend and committed `.terraform.lock.hcl`.
-- `stages/enterprise/`: Locked 35-variable multi-project stage with `envs/{dev,staging,prod}.tfvars.example`.
+- `stages/enterprise/`: Locked 35-variable multi-project stage with `envs/{dev,uat,staging,prod}.tfvars.example`.
 - `src/cpr_treeshap/`: Exact `OMP_NUM_THREADS=1` XGBoost TreeSHAP Vertex AI CPR predictor.
 - `src/scorer_service/`: Fail-closed Cloud Run v2 scorer and BigQuery Storage Write API ledger writer.
 - `src/mrm_validation/`: Challenger gate computing ROC-AUC, KS, disparate impact, and `model_card.json`.

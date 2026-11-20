@@ -94,11 +94,11 @@ variable "enable_scorer_service" {
 variable "environment" {
   type        = string
   default     = "dev"
-  description = "Target deployment environment: dev, staging, or prod."
+  description = "Target deployment environment: dev, uat, staging, or prod."
 
   validation {
-    condition     = contains(["dev", "staging", "prod"], var.environment)
-    error_message = "environment must be one of dev, staging, or prod."
+    condition     = contains(["dev", "uat", "staging", "prod"], var.environment)
+    error_message = "environment must be one of dev, uat, staging, or prod."
   }
 }
 

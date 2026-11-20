@@ -29,7 +29,10 @@ Complete [QUESTIONNAIRE.md](../../../QUESTIONNAIRE.md) before editing `stages/en
 
 Confirm these required decisions:
 
-- `environment` (`dev`, `staging`, `prod`), `region` (`asia-southeast1`), and `prefix`.
+- `environment` (`dev`, `uat`, `staging`, `prod`), `region` (`asia-southeast1`), and `prefix`.
+- Suggest a `3-6` char company acronym `prefix` from core org words and confirm.
+- Write Section 1 links to `00_linked.auto.tfvars.json`.
+- Write Sections 2 and 3 values to `envs/<env>.tfvars`.
 - `ds_serving_track`: `bqml_batch`, `vertex_cpr_online`, or `both`.
 - `enable_online_feature_store`: keep `false` in `asia-southeast2` because online serving is unsupported there.
 - `fairness_min_disparate_impact` (`0.80`) and `shap_additivity_tolerance` (`0.00001`).

@@ -27,6 +27,7 @@ STAGE_BASE_FILES = frozenset({
 ENTERPRISE_EXTRA_ENTRIES = frozenset({"envs"})
 EXPECTED_ENV_EXAMPLES = frozenset({
     "dev.tfvars.example",
+    "uat.tfvars.example",
     "staging.tfvars.example",
     "prod.tfvars.example",
 })

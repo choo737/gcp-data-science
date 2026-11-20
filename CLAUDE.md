@@ -12,9 +12,11 @@ Load [the setup skill](.agents/skills/setup-data-science/SKILL.md) before runnin
 - Read Bronze feeds from [gcp-data-ingestion](https://github.com/choo737/gcp-data-ingestion).
 - Read Silver features from [gcp-data-medallion](https://github.com/choo737/gcp-data-medallion).
 - Check optional `platform-context.json` from [gcp-launchpad](https://github.com/choo737/gcp-launchpad) or complete `QUESTIONNAIRE.md` first.
-- Link Greenfield outputs via `scripts/link-stages.sh --env <env>` or populate Brownfield `00_linked.auto.tfvars.json`.
+- Link Greenfield outputs via `scripts/link-stages.sh --env <env>` (`dev`, `uat`, `staging`, `prod`).
+- For Brownfield setups, populate `stages/enterprise/00_linked.auto.tfvars.json`.
+- Map `QUESTIONNAIRE.md` Sections 2 and 3 to `stages/enterprise/envs/<env>.tfvars`.
 - Keep all three `modules/ds/` directories at exact five-file symmetry.
-- Keep `stages/enterprise/variables.tf` locked at exactly `32` variables.
+- Keep `stages/enterprise/variables.tf` locked at exactly `35` variables.
 - Never use `explanation_spec`, `google_notebooks_instance`, or `optimized` Feature Online Store blocks.
 - Pin Terraform `>= 1.8.0` and `hashicorp/google` `>= 8.0.0, < 9.0.0`.
 - Run `make fmt-check`, `make validate`, and `make test` after every edit.

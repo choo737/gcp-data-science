@@ -1,0 +1,14 @@
+# Link upstream gcp-foundation uat outputs via scripts/link-stages.sh --env uat before apply.
+environment                   = "uat"
+prefix                        = "ent-uat"
+region                        = "asia-southeast1"
+ds_serving_track              = "both"
+enable_bqml_schedule          = true
+# Bigtable online serving starts at 1 node = $0.72/hr (~$525.60/mo) in asia-southeast1; opt in only for <25 ms online feature serving.
+enable_online_feature_store   = false
+enable_scorer_service         = true
+scorer_container_image        = "asia-southeast1-docker.pkg.dev/example-ml-ops-project/ml-containers/xai-scorer:uat"
+deploy_cpr_model              = true
+cpr_container_image           = "asia-southeast1-docker.pkg.dev/example-ml-ops-project/ml-containers/cpr-treeshap:uat"
+fairness_min_disparate_impact = 0.80
+shap_additivity_tolerance     = 0.00001

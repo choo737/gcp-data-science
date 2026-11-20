@@ -108,7 +108,21 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
         self.assertIn("GCP_DS_WIF_SA || vars.GCP_WIF_SERVICE_ACCOUNT", deploy_text)
         self.assertIn("data-science/data-science-outputs.json", deploy_text)
         self.assertIn('data-science/${DOMAIN_NAME}/data-science-outputs.json', deploy_text)
-        self.assertEqual(deploy_text.count('--domain-name "${DOMAIN_NAME}" --tfstate-bucket "${TF_STATE_BUCKET}"'), 3)
+        self.assertEqual(deploy_text.count('--domain-name "${DOMAIN_NAME}" --tfstate-bucket "${TF_STATE_BUCKET}"'), 4)
+        for uat_token in (
+            "- uat",
+            "apply-uat:",
+            "environment: uat",
+            "./scripts/link-stages.sh --env uat",
+            'BACKEND_PREFIX="data-science/${DOMAIN_NAME}/enterprise/uat"',
+            'BACKEND_PREFIX="data-science/enterprise/uat"',
+            "envs/uat.tfvars",
+            "envs/uat.tfvars.example",
+        ):
+            self.assertIn(uat_token, deploy_text)
+        uat_example = (REPO_ROOT / "stages" / "enterprise" / "envs" / "uat.tfvars.example").read_text(encoding="utf-8")
+        self.assertRegex(uat_example, r'environment\s*=\s*"uat"')
+        self.assertIn("cpr_container_image", uat_example)
 
     def test_bqml_workflow_yaml_and_sql_contracts(self) -> None:
         wf_text = (REPO_ROOT / "workflows" / "bqml_xai_pipeline.workflows.yaml").read_text(encoding="utf-8")
@@ -462,6 +476,187 @@ class DsWorkflowsAndDocsTest(unittest.TestCase):
             self.assertEqual(nogit_res.returncode, 0, nogit_res.stderr)
             nogit_lines = tf_log.read_text(encoding="utf-8").splitlines()
             self.assertTrue(any("-backend-config=prefix=data/enterprise/03-data-science/prod" in l for l in nogit_lines), nogit_lines)
+
+            # Verify --env uat succeeds, non-.git apps/ fallback resolves, and invalid --env qa fails.
+            uat_res = subprocess.run(
+                [str(script_path), "--env", "uat", str(src), str(dst)],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(uat_res.returncode, 0, uat_res.stderr)
+            uat_linked = json.loads((dst / "00_linked.auto.tfvars.json").read_text(encoding="utf-8"))
+            self.assertEqual(uat_linked["environment"], "uat")
+
+            apps_nogit_stage = nogit_repo / "apps" / "enterprise"
+            (apps_nogit_stage / "envs").mkdir(parents=True)
+            apps_uat_res = subprocess.run(
+                [
+                    str(script_path),
+                    "--env",
+                    "uat",
+                    "--tfstate-bucket",
+                    "state-bkt",
+                    str(apps_nogit_stage),
+                    str(dst),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(apps_uat_res.returncode, 0, apps_uat_res.stderr)
+            apps_lines = tf_log.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(any("-backend-config=prefix=apps/enterprise/uat" in l for l in apps_lines), apps_lines)
+
+            bad_env_res = subprocess.run(
+                [str(script_path), "--env", "qa", str(src), str(dst)],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(bad_env_res.returncode, 0)
+            self.assertIn("Invalid --env value: qa", bad_env_res.stderr)
+
+    def test_link_stages_routes_ai_subnet_and_allows_ds_alias_override(self) -> None:
+        script_path = REPO_ROOT / "scripts" / "link-stages.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bin_dir = tmp_path / "bin"
+            gcs_store = tmp_path / "gcs_store"
+            net_stage = tmp_path / "02-security-network"
+            ds_stage = tmp_path / "03-data-science"
+            dst = tmp_path / "stages" / "enterprise"
+            for d in (bin_dir, gcs_store, net_stage, ds_stage, dst):
+                d.mkdir(parents=True)
+
+            (dst / "variables.tf").write_text(
+                'variable "egress_connector_subnet_id" { type = string }\n'
+                'variable "subnet_id" { type = string }\n'
+                'variable "environment" { type = string }\n',
+                encoding="utf-8",
+            )
+
+            base_sub = "projects/net/regions/asia-southeast1/subnetworks/base-sub"
+            data_sub = "projects/net/regions/asia-southeast1/subnetworks/data-sub"
+            ai_sub = "projects/net/regions/asia-southeast1/subnetworks/ai-sub"
+            ds_override_sub = "projects/net/regions/asia-southeast1/subnetworks/ds-override-sub"
+            explicit_egress_sub = "projects/net/regions/asia-southeast1/subnetworks/explicit-egress-sub"
+
+            tf_shim = bin_dir / "terraform"
+            tf_shim.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "chdir = next(a.split('=', 1)[1] for a in sys.argv[1:] if a.startswith('-chdir='))\n"
+                "mode = os.environ.get('DS_SUBNET_TEST_MODE', 'ai_subnet')\n"
+                "if '02-security-network' in chdir:\n"
+                "    payload = {\n"
+                "        'environment': {'value': 'uat', 'sensitive': False},\n"
+                f"        'subnet_id': {{'value': {base_sub!r}, 'sensitive': False}},\n"
+                f"        'data_subnet_id': {{'value': {data_sub!r}, 'sensitive': False}},\n"
+                "    }\n"
+                "    if mode != 'alias_override_only':\n"
+                f"        payload['ai_subnet_id'] = {{'value': {ai_sub!r}, 'sensitive': False}}\n"
+                "    print(json.dumps(payload))\n"
+                "else:\n"
+                "    if mode == 'explicit_egress':\n"
+                "        print(json.dumps({\n"
+                "            'environment': {'value': 'uat', 'sensitive': False},\n"
+                f"            'egress_connector_subnet_id': {{'value': {explicit_egress_sub!r}, 'sensitive': False}},\n"
+                "        }))\n"
+                "    else:\n"
+                "        print(json.dumps({\n"
+                "            'environment': {'value': 'uat', 'sensitive': False},\n"
+                f"            'subnet_id': {{'value': {ds_override_sub!r}, 'sensitive': False}},\n"
+                "        }))\n",
+                encoding="utf-8",
+            )
+            tf_shim.chmod(0o755)
+
+            gcloud_shim = bin_dir / "gcloud"
+            gcloud_shim.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                "import shutil, sys\n"
+                f"store = Path({str(gcs_store)!r})\n"
+                "args = sys.argv[1:]\n"
+                "src_arg, dst_arg = args[2], args[3]\n"
+                "if dst_arg.startswith('gs://'):\n"
+                "    shutil.copyfile(src_arg, store / dst_arg.replace('gs://', '').replace('/', '__'))\n"
+                "elif src_arg.startswith('gs://') and dst_arg == '-':\n"
+                "    sys.stdout.write((store / src_arg.replace('gs://', '').replace('/', '__')).read_text(encoding='utf-8'))\n",
+                encoding="utf-8",
+            )
+            gcloud_shim.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+
+            # Case 1: ai_subnet_id present -> routes into both egress_connector_subnet_id and subnet_id (local + GCS).
+            res_ai = subprocess.run(
+                [str(script_path), "--env", "uat", str(net_stage), str(dst)],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(res_ai.returncode, 0, res_ai.stderr)
+            linked_ai = json.loads((dst / "00_linked.auto.tfvars.json").read_text(encoding="utf-8"))
+            self.assertEqual(linked_ai["egress_connector_subnet_id"], ai_sub)
+            self.assertEqual(linked_ai["subnet_id"], ai_sub)
+
+            gcs_uri = "gs://example-state/foundation-outputs.json"
+            exp_res = subprocess.run(
+                [str(script_path), "--env", "uat", "--export-gcs", gcs_uri, str(net_stage)],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(exp_res.returncode, 0, exp_res.stderr)
+            gcs_res = subprocess.run(
+                [str(script_path), "--env", "uat", "--from-gcs", gcs_uri, str(dst)],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(gcs_res.returncode, 0, gcs_res.stderr)
+            linked_gcs = json.loads((dst / "00_linked.auto.tfvars.json").read_text(encoding="utf-8"))
+            self.assertEqual(linked_gcs["egress_connector_subnet_id"], ai_sub)
+            self.assertEqual(linked_gcs["subnet_id"], ai_sub)
+
+            # Case 2: 03-data-science subnet_id overrides 02-security-network base subnet_id on OUTPUT_ALIASES.
+            override_env = env.copy()
+            override_env["DS_SUBNET_TEST_MODE"] = "alias_override_only"
+            res_override = subprocess.run(
+                [str(script_path), "--env", "uat", str(net_stage), str(ds_stage), str(dst)],
+                env=override_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(res_override.returncode, 0, res_override.stderr)
+            linked_override = json.loads((dst / "00_linked.auto.tfvars.json").read_text(encoding="utf-8"))
+            self.assertEqual(linked_override["egress_connector_subnet_id"], ds_override_sub)
+            self.assertEqual(linked_override["subnet_id"], ds_override_sub)
+
+            # Case 3: explicit egress_connector_subnet_id from 03-data-science is preserved even if ai_subnet_id exists.
+            explicit_env = env.copy()
+            explicit_env["DS_SUBNET_TEST_MODE"] = "explicit_egress"
+            res_explicit = subprocess.run(
+                [str(script_path), "--env", "uat", str(net_stage), str(ds_stage), str(dst)],
+                env=explicit_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(res_explicit.returncode, 0, res_explicit.stderr)
+            linked_explicit = json.loads((dst / "00_linked.auto.tfvars.json").read_text(encoding="utf-8"))
+            self.assertEqual(linked_explicit["egress_connector_subnet_id"], explicit_egress_sub)
+            self.assertEqual(linked_explicit["subnet_id"], ai_sub)
 
 
 if __name__ == "__main__":
