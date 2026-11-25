@@ -1,0 +1,10 @@
+# Default platform and model risk reviewers for regulated data science assets.
+# Replace @example-org teams with your private repository GitHub teams on Day 0.
+/modules/ds/ @example-org/ml-platform-leads
+/sql/ @example-org/data-science-leads
+/src/cpr_treeshap/ @example-org/ml-engineering-leads
+/src/scorer_service/ @example-org/ml-platform-leads
+/src/mrm_validation/ @example-org/model-risk-validators
+/src/pipelines/ @example-org/data-science-leads
+/stages/ @example-org/ml-platform-leads
+/workflows/ @example-org/ml-platform-leads

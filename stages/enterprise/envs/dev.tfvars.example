@@ -1,0 +1,23 @@
+# Link upstream gcp-foundation dev outputs via scripts/link-stages.sh --env dev before apply.
+# Linked outputs reside in 00_linked.auto.tfvars.json; keep linked keys commented out below:
+# core_project_id            = "example-core-project"
+# ds_exp_project_id          = "example-ds-exp-project"
+# ml_ops_project_id          = "example-ml-ops-project"
+# silver_dataset_id          = "ent_silver_curated"
+# ml_audit_dataset_id        = "ent_ml_xai_audit"
+# ml_artifact_repo_id        = "ml-containers"
+# ml_worm_bucket_name        = "example-ml-worm-bucket"
+# vpc_id                     = "projects/example-host-project/global/networks/example-vpc"
+# egress_connector_subnet_id = "projects/example-host-project/regions/asia-southeast1/subnetworks/example-ai-subnet"
+# kms_key_id                 = "projects/example-kms-project/locations/asia-southeast1/keyRings/example/cryptoKeys/cmek"
+
+environment                   = "dev"
+prefix                        = "ent-dev"
+region                        = "asia-southeast1"
+ds_serving_track              = "bqml_batch"
+enable_bqml_schedule          = false
+enable_online_feature_store   = false
+enable_scorer_service         = false
+deploy_cpr_model              = false
+fairness_min_disparate_impact = 0.80
+shap_additivity_tolerance     = 0.00001

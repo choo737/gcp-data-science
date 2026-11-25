@@ -1,0 +1,451 @@
+main:
+  params: [input]
+  steps:
+    - init_vars:
+        assign:
+          - project_id: ${sys.get_env("ML_OPS_PROJECT_ID")}
+          - core_project_id: ${sys.get_env("CORE_PROJECT_ID")}
+          - silver_dataset_id: ${sys.get_env("SILVER_DATASET_ID")}
+          - feature_table: ${sys.get_env("FEATURE_GROUP_SOURCE_TABLE")}
+          - audit_dataset_id: ${sys.get_env("ML_AUDIT_DATASET_ID")}
+          - audit_table_id: ${sys.get_env("ML_AUDIT_TABLE_ID")}
+          - labels_table_id: ${sys.get_env("ML_TRAINING_LABELS_TABLE_ID")}
+          - worm_bucket: ${sys.get_env("ML_WORM_BUCKET_NAME")}
+          - bq_location: ${sys.get_env("BQ_LOCATION")}
+          - model_id: ${sys.get_env("MODEL_ID")}
+          - reason_rule_version: ${sys.get_env("REASON_RULE_VERSION")}
+          - alert_topic: ${sys.get_env("ALERT_TOPIC_PATH")}
+          - execution_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+          - run_train: true
+          - worm_export_job: ""
+    - validate_identifiers:
+        switch:
+          - condition: ${not text.match_regex(project_id, "^[a-z][a-z0-9-]{4,28}[a-z0-9]$")}
+            raise: '${"Invalid ML_OPS_PROJECT_ID identifier: " + project_id}'
+          - condition: ${not text.match_regex(core_project_id, "^[a-z][a-z0-9-]{4,28}[a-z0-9]$")}
+            raise: '${"Invalid CORE_PROJECT_ID identifier: " + core_project_id}'
+          - condition: ${not (len(silver_dataset_id) <= 1024 and text.match_regex(silver_dataset_id, "^[A-Za-z0-9_]+$"))}
+            raise: '${"Invalid SILVER_DATASET_ID identifier: " + silver_dataset_id}'
+          - condition: ${not (len(feature_table) <= 1024 and text.match_regex(feature_table, "^[A-Za-z0-9_]+$"))}
+            raise: '${"Invalid FEATURE_GROUP_SOURCE_TABLE identifier: " + feature_table}'
+          - condition: ${not (len(audit_dataset_id) <= 1024 and text.match_regex(audit_dataset_id, "^[A-Za-z0-9_]+$"))}
+            raise: '${"Invalid ML_AUDIT_DATASET_ID identifier: " + audit_dataset_id}'
+          - condition: ${not (len(audit_table_id) <= 1024 and text.match_regex(audit_table_id, "^[A-Za-z0-9_]+$"))}
+            raise: '${"Invalid ML_AUDIT_TABLE_ID identifier: " + audit_table_id}'
+          - condition: ${not (len(labels_table_id) <= 1024 and text.match_regex(labels_table_id, "^[A-Za-z0-9_]+$"))}
+            raise: '${"Invalid ML_TRAINING_LABELS_TABLE_ID identifier: " + labels_table_id}'
+          - condition: ${not (len(model_id) <= 1024 and text.match_regex(model_id, "^[A-Za-z0-9_]+$"))}
+            raise: '${"Invalid MODEL_ID identifier: " + model_id}'
+          - condition: ${worm_bucket != "" and not text.match_regex(worm_bucket, "^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$")}
+            raise: '${"Invalid ML_WORM_BUCKET_NAME identifier: " + worm_bucket}'
+          - condition: ${not text.match_regex(execution_id, "^[A-Za-z0-9_-]{1,128}$")}
+            raise: '${"Invalid execution_id identifier: " + execution_id}'
+    - build_fqns_and_sql:
+        assign:
+          - model_fqn: ${project_id + "." + audit_dataset_id + "." + model_id}
+          - feature_fqn: ${core_project_id + "." + silver_dataset_id + "." + feature_table}
+          - labels_fqn: ${project_id + "." + audit_dataset_id + "." + labels_table_id}
+          - ledger_fqn: ${project_id + "." + audit_dataset_id + "." + audit_table_id}
+          - worm_export_uri: ${"gs://" + worm_bucket + "/track_a/" + execution_id + "-*.json"}
+          - train_sql_template: |
+              CREATE OR REPLACE MODEL `__MODEL_FQN__`
+              OPTIONS (
+                model_type = 'BOOSTED_TREE_CLASSIFIER',
+                input_label_cols = ['approved_flag'],
+                enable_global_explain = TRUE,
+                model_registry = 'VERTEX_AI',
+                vertex_ai_model_id = '__MODEL_ID__',
+                max_iterations = 50,
+                learn_rate = 0.1
+              ) AS
+              SELECT
+                f.tenure_months,
+                f.avg_monthly_spend,
+                f.rolling_order_count,
+                f.days_since_last_order,
+                f.cancellation_rate_30d,
+                f.discount_utilization_ratio,
+                f.approved_flag
+              FROM ML.ENTITY_FEATURES_AT_TIME(
+                (
+                  SELECT
+                    entity_id,
+                    feature_timestamp,
+                    tenure_months,
+                    avg_monthly_spend,
+                    rolling_order_count,
+                    days_since_last_order,
+                    cancellation_rate_30d,
+                    discount_utilization_ratio
+                  FROM `__FEATURE_FQN__`
+                  WHERE feature_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 730 DAY)
+                ),
+                (
+                  SELECT
+                    entity_id,
+                    label_timestamp AS time,
+                    approved_flag
+                  FROM `__LABELS_FQN__`
+                  WHERE label_timestamp >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 730 DAY))
+                ),
+                num_rows => 1,
+                ignore_feature_nulls => FALSE
+              ) AS f
+          - explain_sql_template: |
+              INSERT INTO `__LEDGER_FQN__` (
+                decision_id,
+                entity_id,
+                decision_timestamp,
+                serving_track,
+                model_id,
+                model_version_id,
+                model_artifact_sha256,
+                container_image_digest,
+                schema_version,
+                explained_class,
+                approve_prob,
+                raw_margin,
+                base_logit,
+                shap_sum_logit,
+                shap_logit_map,
+                top_adverse_reasons,
+                feature_payload,
+                reason_rule_version
+              )
+              SELECT
+                GENERATE_UUID() AS decision_id,
+                CAST(p.entity_id AS STRING) AS entity_id,
+                CURRENT_TIMESTAMP() AS decision_timestamp,
+                'bqml_batch' AS serving_track,
+                @model_id AS model_id,
+                @model_version_id AS model_version_id,
+                'bqml-managed' AS model_artifact_sha256,
+                'bqml-native' AS container_image_digest,
+                'v1' AS schema_version,
+                'APPROVE' AS explained_class,
+                IF(
+                  CAST(p.predicted_approved_flag AS INT64) = 1,
+                  CAST(p.probability AS FLOAT64),
+                  1.0 - CAST(p.probability AS FLOAT64)
+                ) AS approve_prob,
+                IF(
+                  ABS(
+                    (
+                      CAST(p.baseline_prediction_value AS FLOAT64) + COALESCE(
+                        (SELECT SUM(attr.attribution) FROM UNNEST(p.top_feature_attributions) AS attr),
+                        0.0
+                      )
+                    ) - CAST(p.prediction_value AS FLOAT64)
+                  ) > 1e-5 * GREATEST(1.0, ABS(CAST(p.prediction_value AS FLOAT64))),
+                  ERROR(FORMAT(
+                    'TreeSHAP additivity breach on entity %s: baseline %g + sum %g != prediction_value %g',
+                    CAST(p.entity_id AS STRING),
+                    CAST(p.baseline_prediction_value AS FLOAT64),
+                    COALESCE((SELECT SUM(attr.attribution) FROM UNNEST(p.top_feature_attributions) AS attr), 0.0),
+                    CAST(p.prediction_value AS FLOAT64)
+                  )),
+                  IF(
+                    CAST(p.predicted_approved_flag AS INT64) = 1,
+                    LN(GREATEST(CAST(p.probability AS FLOAT64), 1e-15) / GREATEST(1.0 - CAST(p.probability AS FLOAT64), 1e-15)),
+                    LN(GREATEST(1.0 - CAST(p.probability AS FLOAT64), 1e-15) / GREATEST(CAST(p.probability AS FLOAT64), 1e-15))
+                  )
+                ) AS raw_margin,
+                IF(
+                  CAST(p.predicted_approved_flag AS INT64) = 1,
+                  CAST(p.baseline_prediction_value AS FLOAT64),
+                  -CAST(p.baseline_prediction_value AS FLOAT64)
+                ) AS base_logit,
+                IF(
+                  CAST(p.predicted_approved_flag AS INT64) = 1,
+                  CAST(
+                    COALESCE(
+                      (SELECT SUM(attr.attribution) FROM UNNEST(p.top_feature_attributions) AS attr),
+                      0.0
+                    ) AS FLOAT64
+                  ),
+                  -CAST(
+                    COALESCE(
+                      (SELECT SUM(attr.attribution) FROM UNNEST(p.top_feature_attributions) AS attr),
+                      0.0
+                    ) AS FLOAT64
+                  )
+                ) AS shap_sum_logit,
+                COALESCE(
+                  (
+                    SELECT JSON_OBJECT(
+                      ARRAY_AGG(attr.feature ORDER BY attr.feature),
+                      ARRAY_AGG(
+                        IF(
+                          CAST(p.predicted_approved_flag AS INT64) = 1,
+                          CAST(attr.attribution AS FLOAT64),
+                          -CAST(attr.attribution AS FLOAT64)
+                        )
+                        ORDER BY attr.feature
+                      )
+                    )
+                    FROM UNNEST(p.top_feature_attributions) AS attr
+                  ),
+                  JSON '{}'
+                ) AS shap_logit_map,
+                TO_JSON(ARRAY(
+                  SELECT AS STRUCT
+                    CASE attr.feature
+                      WHEN 'tenure_months' THEN 'RC01'
+                      WHEN 'avg_monthly_spend' THEN 'RC02'
+                      WHEN 'rolling_order_count' THEN 'RC03'
+                      WHEN 'days_since_last_order' THEN 'RC04'
+                      WHEN 'cancellation_rate_30d' THEN 'RC05'
+                      WHEN 'discount_utilization_ratio' THEN 'RC06'
+                      ELSE 'RC99'
+                    END AS reason_code,
+                    CASE attr.feature
+                      WHEN 'tenure_months' THEN 'Short customer relationship tenure relative to underwriting policy'
+                      WHEN 'avg_monthly_spend' THEN 'Insufficient rolling 30-day net transaction volume'
+                      WHEN 'rolling_order_count' THEN 'Low verified order frequency in trailing 30-day window'
+                      WHEN 'days_since_last_order' THEN 'Extended account inactivity since last completed transaction'
+                      WHEN 'cancellation_rate_30d' THEN 'Elevated 30-day order cancellation or reversal rate'
+                      WHEN 'discount_utilization_ratio' THEN 'High promotional discount dependency relative to gross spend'
+                      ELSE CONCAT('Adverse model attribution on ', attr.feature)
+                    END AS reason_text,
+                    attr.feature AS feature,
+                    IF(
+                      CAST(p.predicted_approved_flag AS INT64) = 1,
+                      CAST(attr.attribution AS FLOAT64),
+                      -CAST(attr.attribution AS FLOAT64)
+                    ) AS attribution
+                  FROM UNNEST(p.top_feature_attributions) AS attr
+                  WHERE IF(CAST(p.predicted_approved_flag AS INT64) = 1, attr.attribution, -attr.attribution) < 0
+                  ORDER BY IF(CAST(p.predicted_approved_flag AS INT64) = 1, attr.attribution, -attr.attribution) ASC, attr.feature ASC
+                  LIMIT 4
+                )) AS top_adverse_reasons,
+                TO_JSON(STRUCT(
+                  p.tenure_months,
+                  p.avg_monthly_spend,
+                  p.rolling_order_count,
+                  p.days_since_last_order,
+                  p.cancellation_rate_30d,
+                  p.discount_utilization_ratio
+                )) AS feature_payload,
+                @reason_rule_version AS reason_rule_version
+              FROM ML.EXPLAIN_PREDICT(
+                MODEL `__MODEL_FQN__`,
+                (
+                  SELECT
+                    entity_id,
+                    tenure_months,
+                    avg_monthly_spend,
+                    rolling_order_count,
+                    days_since_last_order,
+                    cancellation_rate_30d,
+                    discount_utilization_ratio
+                  FROM ML.FEATURES_AT_TIME(
+                    (
+                      SELECT
+                        entity_id,
+                        feature_timestamp,
+                        tenure_months,
+                        avg_monthly_spend,
+                        rolling_order_count,
+                        days_since_last_order,
+                        cancellation_rate_30d,
+                        discount_utilization_ratio
+                      FROM `__FEATURE_FQN__`
+                      WHERE feature_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+                    ),
+                    time => CURRENT_TIMESTAMP(),
+                    num_rows => 1,
+                    ignore_feature_nulls => FALSE
+                  )
+                ),
+                STRUCT(100 AS top_k_features, FALSE AS approx_feature_contrib)
+              ) AS p
+          - export_worm_sql_template: |
+              EXPORT DATA OPTIONS (
+                uri = '__WORM_EXPORT_URI__',
+                format = 'JSON',
+                overwrite = false
+              ) AS
+              SELECT
+                decision_id,
+                entity_id,
+                decision_timestamp,
+                serving_track,
+                model_id,
+                model_version_id,
+                model_artifact_sha256,
+                container_image_digest,
+                schema_version,
+                explained_class,
+                approve_prob,
+                raw_margin,
+                base_logit,
+                shap_sum_logit,
+                shap_logit_map,
+                top_adverse_reasons,
+                feature_payload,
+                reason_rule_version
+              FROM `__LEDGER_FQN__`
+              WHERE decision_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+                AND serving_track = 'bqml_batch'
+                AND model_id = @model_id
+                AND model_version_id = @model_version_id
+          - train_sql: ${text.replace_all(text.replace_all(text.replace_all(text.replace_all(train_sql_template, "__MODEL_FQN__", model_fqn), "__MODEL_ID__", model_id), "__FEATURE_FQN__", feature_fqn), "__LABELS_FQN__", labels_fqn)}
+          - explain_sql: ${text.replace_all(text.replace_all(text.replace_all(explain_sql_template, "__LEDGER_FQN__", ledger_fqn), "__MODEL_FQN__", model_fqn), "__FEATURE_FQN__", feature_fqn)}
+          - export_worm_sql: ${text.replace_all(text.replace_all(export_worm_sql_template, "__WORM_EXPORT_URI__", worm_export_uri), "__LEDGER_FQN__", ledger_fqn)}
+    - check_train_flag:
+        switch:
+          - condition: ${input != null and "train_model" in input and input.train_model != null}
+            assign:
+              - run_train: ${input.train_model}
+    - run_pipeline:
+        try:
+          steps:
+            - maybe_train_model:
+                switch:
+                  - condition: ${run_train}
+                    next: submit_train_job
+                next: submit_explain_job
+            - submit_train_job:
+                call: run_bq_query
+                args:
+                  project_id: ${project_id}
+                  location: ${bq_location}
+                  query: ${train_sql}
+                  params: []
+                result: train_result
+            - submit_explain_job:
+                call: run_bq_query
+                args:
+                  project_id: ${project_id}
+                  location: ${bq_location}
+                  query: ${explain_sql}
+                  params:
+                    - name: model_id
+                      parameterType:
+                        type: STRING
+                      parameterValue:
+                        value: ${model_id}
+                    - name: model_version_id
+                      parameterType:
+                        type: STRING
+                      parameterValue:
+                        value: ${execution_id}
+                    - name: reason_rule_version
+                      parameterType:
+                        type: STRING
+                      parameterValue:
+                        value: ${reason_rule_version}
+                result: explain_result
+            - maybe_export_worm:
+                switch:
+                  - condition: ${worm_bucket != ""}
+                    next: submit_worm_export_job
+                next: return_ok
+            - submit_worm_export_job:
+                call: run_bq_query
+                args:
+                  project_id: ${project_id}
+                  location: ${bq_location}
+                  query: ${export_worm_sql}
+                  params:
+                    - name: model_id
+                      parameterType:
+                        type: STRING
+                      parameterValue:
+                        value: ${model_id}
+                    - name: model_version_id
+                      parameterType:
+                        type: STRING
+                      parameterValue:
+                        value: ${execution_id}
+                result: worm_export_result
+            - assign_worm_job:
+                assign:
+                  - worm_export_job: ${worm_export_result.job_id}
+            - return_ok:
+                return:
+                  status: "SUCCEEDED"
+                  execution_id: ${execution_id}
+                  explain_job: ${explain_result.job_id}
+                  worm_export_job: ${worm_export_job}
+        except:
+          as: err
+          steps:
+            - publish_failure_alert:
+                try:
+                  call: http.post
+                  args:
+                    url: ${"https://pubsub.googleapis.com/v1/" + alert_topic + ":publish"}
+                    auth:
+                      type: OAuth2
+                    body:
+                      messages:
+                        - data: ${base64.encode(json.encode(err))}
+                retry: ${http.default_retry}
+            - fail_workflow:
+                raise: ${err}
+
+run_bq_query:
+  params: [project_id, location, query, params]
+  steps:
+    - submit_job:
+        try:
+          call: googleapis.bigquery.v2.jobs.insert
+          args:
+            projectId: ${project_id}
+            connector_params:
+              skip_polling: true
+            body:
+              jobReference:
+                projectId: ${project_id}
+                location: ${location}
+              configuration:
+                query:
+                  query: ${query}
+                  useLegacySql: false
+                  parameterMode: "NAMED"
+                  queryParameters: ${params}
+                labels:
+                  pipeline: "track_a_bqml_xai"
+          result: job_resp
+        retry: ${http.default_retry_non_idempotent}
+    - init_poll:
+        assign:
+          - job_id: ${job_resp.jobReference.jobId}
+          - polls: 0
+          - max_polls: 120
+          - poll_interval_seconds: 5
+          - job_done: false
+    - poll_job:
+        try:
+          call: googleapis.bigquery.v2.jobs.get
+          args:
+            projectId: ${project_id}
+            jobId: ${job_id}
+            location: ${location}
+          result: status_resp
+        retry: ${http.default_retry}
+    - check_job_done:
+        assign:
+          - polls: ${polls + 1}
+          - job_done: ${status_resp.status.state == "DONE"}
+        next: evaluate_poll
+    - evaluate_poll:
+        switch:
+          - condition: ${job_done}
+            next: verify_no_error
+          - condition: ${polls >= max_polls}
+            raise: '${"BigQuery job timed out after max_polls: " + job_id}'
+        next: wait_before_retry
+    - wait_before_retry:
+        call: sys.sleep
+        args:
+          seconds: ${poll_interval_seconds}
+        next: poll_job
+    - verify_no_error:
+        switch:
+          - condition: ${"errorResult" in status_resp.status}
+            raise: ${status_resp.status.errorResult}
+        return:
+          job_id: ${job_id}
+          state: ${status_resp.status.state}

@@ -1,0 +1,12 @@
+[project]
+name = "xai-scorer-service"
+version = "0.1.0"
+description = "Fail-closed Cloud Run v2 XAI scorer service with synchronous Storage Write API audit logging."
+requires-python = ">=3.13"
+dependencies = [
+  "google-cloud-bigquery-storage>=2.27.0,<4.0.0",
+  "google-cloud-storage>=2.18.0,<4.0.0",
+  "google-auth>=2.35.0,<3.0.0",
+  "requests>=2.32.0,<3.0.0",
+  "gunicorn>=23.0.0,<24.0.0",
+]
